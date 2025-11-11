@@ -1,0 +1,2 @@
+source /Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader/gdbinit/symbols
+source /Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader/gdbinit/connect

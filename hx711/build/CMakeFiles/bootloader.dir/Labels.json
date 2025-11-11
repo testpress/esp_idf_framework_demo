@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/CMakeFiles/bootloader"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/CMakeFiles/bootloader.rule"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/CMakeFiles/bootloader-complete.rule"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+		},
+		{
+			"file" : "/Users/karthikrajan_vijayakumar/workspace/esp_idf_samples/esp_idf_framework_demo/hx711/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"bootloader"
+		],
+		"name" : "bootloader"
+	}
+}
