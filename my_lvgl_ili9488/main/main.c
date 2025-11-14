@@ -48,11 +48,13 @@ static volatile bool touch_interrupt_flag = false;
 
 /* Transfer sizing */
 #define MAX_SPI_TRANS_BYTES  (8 * 1024)   // must match spi_bus_config.max_transfer_sz
-#define LINES                8            // partial lines per chunk
+#define LINES                38           // Large buffer = near-instant updates (80 lines = 1/4 screen)
 #define BUF_PIXELS           (HOR_RES * LINES)
 #define RGB666_BUF_SIZE      (BUF_PIXELS * 3)
 
-static lv_color_t lv_buf[BUF_PIXELS];     // static LVGL buffer (BSS)
+// Dynamic buffers - allocated at runtime to save static RAM
+static lv_color_t *lv_buf1 = NULL;    // First buffer (dynamically allocated)
+static lv_color_t *lv_buf2 = NULL;    // Second buffer for double buffering (dynamically allocated)
 static uint8_t *rgb666_buf = NULL;
 
 /* -------------------------------------------------------------------
@@ -395,7 +397,7 @@ static void nav_btn_handler(lv_event_t *e)
         lv_obj_t *tabview = lv_event_get_user_data(e);
         lv_obj_t *btn = lv_event_get_target(e);
         uint32_t tab_idx = (uint32_t)(uintptr_t)lv_obj_get_user_data(btn);
-        lv_tabview_set_active(tabview, tab_idx, LV_ANIM_ON);
+        lv_tabview_set_active(tabview, tab_idx, LV_ANIM_OFF);  // Instant navigation - no animation!
         
         // Update all navigation button colors
         for (int i = 0; i < 3; i++) {
@@ -885,10 +887,11 @@ void app_main(void)
     }
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 20 * 1000 * 1000,
+        .clock_speed_hz = 40 * 1000 * 1000,  // 40MHz for faster rendering
         .mode = 0,
         .spics_io_num = PIN_TFT_CS,
-        .queue_size = 1,
+        .queue_size = 7,  // Larger queue for better throughput with big buffers
+        .flags = SPI_DEVICE_NO_DUMMY,  // Optimize SPI transfer
     };
     ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg, &tft_spi));
 
@@ -918,6 +921,23 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "Allocated rgb666_buf %u bytes", (unsigned)RGB666_BUF_SIZE);
+    
+    /* Allocate LVGL buffers dynamically for double buffering */
+    size_t lvgl_buf_size = BUF_PIXELS * sizeof(lv_color_t);
+    lv_buf1 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_DMA);
+    if (!lv_buf1) {
+        ESP_LOGE(TAG, "Failed to alloc lv_buf1 (%u bytes)", (unsigned)lvgl_buf_size);
+        return;
+    }
+    
+    lv_buf2 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_DMA);
+    if (!lv_buf2) {
+        ESP_LOGE(TAG, "Failed to alloc lv_buf2 (%u bytes)", (unsigned)lvgl_buf_size);
+        free(lv_buf1);
+        return;
+    }
+    ESP_LOGI(TAG, "Allocated LVGL double buffers: 2 × %u bytes = %u bytes total", 
+             (unsigned)lvgl_buf_size, (unsigned)(lvgl_buf_size * 2));
 
     /* Create LVGL display (v9) */
     lv_display_t *disp = lv_display_create(HOR_RES, VER_RES);
@@ -927,7 +947,8 @@ void app_main(void)
     }
 
     lv_display_set_flush_cb(disp, ili9488_flush);
-    lv_display_set_buffers(disp, lv_buf, NULL, sizeof(lv_buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    // Double buffering: use both buffers for tear-free rendering
+    lv_display_set_buffers(disp, lv_buf1, lv_buf2, lvgl_buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
     
     /* Register touch input device with LVGL */
     lv_indev_t *indev = lv_indev_create();
