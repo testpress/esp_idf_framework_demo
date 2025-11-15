@@ -14,6 +14,18 @@
 #include <stdio.h>
 #include "lvgl.h"
 
+// Camera and network includes
+#include "ArducamCamera.h"
+#include "ArducamLink.h"
+#include "delay.h"
+#include "esp_event.h"
+#include "esp_http_client.h"
+#include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "freertos/event_groups.h"
+#include "nvs_flash.h"
+
 static const char *TAG = "SmartPlate";
 
 /* Display resolution */
@@ -45,11 +57,25 @@ static const char *TAG = "SmartPlate";
 /* Camera pins */
 #define CAMERA_CS  33
 
+/* WiFi configuration */
+#define WIFI_SSID "Testpress_4G"
+#define WIFI_PASS "Tp@12345"
+#define MAXIMUM_RETRY 5
+
+/* API upload configuration */
+static const char *UPLOAD_URL = "http://192.168.0.4:8000/api/v1/meal_logs/";
+static const char *AUTH_HEADER_VALUE = "Bearer iKnCz7E2Mtfl_V0bDcasJWDMzVN39L_BCySvj1hLDSc";
+
 /* Transfer sizing */
 #define MAX_SPI_TRANS_BYTES  (8 * 1024)
-#define LINES                38
+#define LINES                25  // Reduced to fit in fragmented memory (need ~108KB total)
 #define BUF_PIXELS           (HOR_RES * LINES)
 #define RGB666_BUF_SIZE      (BUF_PIXELS * 3)
+
+/* SPI Pin Assignments (to avoid conflicts):
+ * Display (ILI9488) - HSPI_HOST: GPIO 23 (MOSI), GPIO 18 (SCLK), GPIO 5 (CS)
+ * Camera (Arducam) - VSPI_HOST: GPIO 25 (MOSI), GPIO 26 (SCLK), GPIO 19 (MISO), GPIO 33 (CS)
+ */
 
 // Global variables
 static spi_device_handle_t tft_spi;
@@ -57,6 +83,13 @@ static lv_color_t *lv_buf1 = NULL;
 static lv_color_t *lv_buf2 = NULL;
 static uint8_t *rgb666_buf = NULL;
 static volatile bool touch_interrupt_flag = false;
+
+// WiFi and camera globals
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+static int s_retry_num = 0;
+ArducamCamera myCAM;
 
 // HX711 state
 static long hx711_offset = 0;
@@ -86,9 +119,9 @@ static lv_obj_t *result_weight_label = NULL;
 static lv_obj_t *result_food_label = NULL;
 static lv_obj_t *result_nutrition_label = NULL;
 
-// Canvas buffer for captured image display (120x90 pixels - reduced for memory)
-#define CANVAS_WIDTH  120
-#define CANVAS_HEIGHT 90
+// Canvas buffer for captured image display (100x75 pixels - reduced for memory)
+#define CANVAS_WIDTH  100
+#define CANVAS_HEIGHT 75
 static lv_color_t *canvas_buffer = NULL;
 
 /* -------------------------------------------------------------------
@@ -105,8 +138,9 @@ static void hx711_init(void) {
 static bool hx711_wait_ready(int timeout_ms) {
     int64_t start = esp_timer_get_time();
     while (gpio_get_level(HX711_DOUT) == 1) {
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(10 / portTICK_PERIOD_MS);  // longer delay to prevent watchdog
         if ((esp_timer_get_time() - start) > timeout_ms * 1000) {
+            ESP_LOGW(TAG, "HX711 not ready after %d ms", timeout_ms);
             return false;
         }
     }
@@ -144,12 +178,90 @@ static long hx711_read_average(uint16_t samples) {
 
 static void hx711_tare(uint16_t samples) {
     hx711_offset = hx711_read_average(samples);
-    ESP_LOGI(TAG, "HX711 Tared: offset=%ld", hx711_offset);
+    ESP_LOGI(TAG, "[TARE] OFFSET set to %ld (avg of %u samples)", hx711_offset, samples);
 }
 
 static float hx711_get_weight(void) {
     long raw = hx711_read_average(5);
     return (float)((raw - hx711_offset) * hx711_scale);
+}
+
+/* -------------------------------------------------------------------
+ * WiFi Functions
+ * -------------------------------------------------------------------*/
+static void event_handler(void* arg, esp_event_base_t event_base,
+                          int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < MAXIMUM_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "Retry to connect to the AP");
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+        ESP_LOGI(TAG, "Connect to the AP failed");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    // Register events
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    // Configure and start WiFi
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_start() );
+
+    ESP_LOGI(TAG, "wifi_init_sta finished.");
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Connected to AP SSID:%s", WIFI_SSID);
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGE(TAG, "Failed to connect to SSID:%s", WIFI_SSID);
+    } else {
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+    }
 }
 
 /* -------------------------------------------------------------------
@@ -200,7 +312,7 @@ static void ili9488_init(void) {
     send_data_chunked(&pix, 1);
 
     send_cmd(0x29); // Display ON
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 /* -------------------------------------------------------------------
@@ -476,35 +588,138 @@ static void draw_simulated_food_image(float weight) {
     ESP_LOGI(TAG, "Food image rendered on canvas (weight: %.1fg)", weight);
 }
 
-static bool capture_image(uint8_t **image_data, size_t *image_size) {
-    // Simulate image capture - replace with actual camera code
-    // For now, create a dummy image (small JPEG-like structure)
-    *image_size = 1024; // Dummy size
-    
-    // Try PSRAM first, fall back to regular heap if PSRAM not available
-    *image_data = heap_caps_malloc(*image_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    
-    if (*image_data == NULL) {
-        ESP_LOGW(TAG, "PSRAM allocation failed, trying regular heap");
-        *image_data = heap_caps_malloc(*image_size, MALLOC_CAP_8BIT);
-    }
-    
-    if (*image_data == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for image (tried PSRAM and heap)");
-        
-        // Check available memory
-        ESP_LOGE(TAG, "Free heap: %lu bytes, Free PSRAM: %lu bytes", 
-                 esp_get_free_heap_size(), 
-                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+// Simplified image capture that gets image size only (no storage)
+static bool capture_image_simple(size_t *image_size) {
+    ESP_LOGI(TAG, "Starting camera capture");
+
+    // Clear any previous image length
+    myCAM.image_length = 0;
+
+    // Trigger capture (QQVGA JPEG for much smaller file size to save memory)
+    CamStatus status = takePicture(&myCAM, CAM_IMAGE_MODE_QQVGA, CAM_IMAGE_PIX_FMT_JPG);
+    if (status != CAM_ERR_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to take picture, status: %d", status);
         return false;
     }
-    
-    // Fill with dummy data
-    memset(*image_data, 0xAA, *image_size);
-    
-    ESP_LOGI(TAG, "Image captured (simulated): %d bytes (allocated in %s)", 
-             *image_size,
-             heap_caps_get_allocated_size(*image_data) ? "heap" : "PSRAM");
+
+    // Check if image is available (length should be set by takePicture)
+    uint32_t length = imageAvailable(&myCAM);
+    if (length == 0) {
+        ESP_LOGE(TAG, "No image data available after capture");
+        return false;
+    }
+
+    if (length > 100000) {  // Allow up to 100KB for QQVGA images
+        ESP_LOGE(TAG, "Image too large: %u", (unsigned)length);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Image captured successfully: %u bytes", (unsigned)length);
+    *image_size = length;
+
+    return true;
+}
+
+// Legacy function for compatibility (now simplified)
+static bool capture_image(uint8_t **image_data, size_t *image_size) {
+    ESP_LOGI(TAG, "Starting camera capture");
+
+    // Clear any previous image length
+    myCAM.image_length = 0;
+
+    // Trigger capture (QQVGA JPEG for much smaller file size to save memory)
+    CamStatus status = takePicture(&myCAM, CAM_IMAGE_MODE_QQVGA, CAM_IMAGE_PIX_FMT_JPG);
+    if (status != CAM_ERR_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to take picture, status: %d", status);
+        return false;
+    }
+
+    // Check if image is available (length should be set by takePicture)
+    uint32_t length = imageAvailable(&myCAM);
+    if (length == 0) {
+        ESP_LOGE(TAG, "No image data available after capture");
+        return false;
+    }
+
+    if (length > 100000) {  // Allow up to 100KB for QQVGA images
+        ESP_LOGE(TAG, "Image too large: %u", (unsigned)length);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Image length: %u bytes", (unsigned)length);
+    *image_size = length;
+
+    // Allocate PSRAM buffer for image
+    *image_data = heap_caps_malloc(length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!*image_data) {
+        ESP_LOGE(TAG, "Failed to allocate PSRAM for image!");
+        return false;
+    }
+
+    // Read image in small chunks (<=255) because many readBuff implementations use uint8_t length
+    const uint32_t chunk_size = 200; // MUST be <= 255
+    uint8_t *tmp_buf = heap_caps_malloc(chunk_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tmp_buf) {
+        ESP_LOGE(TAG, "Failed to allocate tmp buffer!");
+        heap_caps_free(*image_data);
+        *image_data = NULL;
+        return false;
+    }
+
+    uint32_t bytes_read = 0;
+    while (bytes_read < length) {
+        uint32_t remaining = length - bytes_read;
+        uint32_t to_read = (remaining > chunk_size) ? chunk_size : remaining;
+
+        // readBuff typically returns uint8_t (0..255)
+        uint8_t got = 0;
+        int retry = 0;
+        const int max_read_retries = 5;
+
+        while (retry < max_read_retries) {
+            // Ensure camera FSM runs in between attempts
+            captureThread(&myCAM);
+            got = readBuff(&myCAM, tmp_buf, (uint8_t)to_read);
+            if (got > 0) break;
+            // if got == 0, wait a bit and retry
+            vTaskDelay(pdMS_TO_TICKS(10 + retry*5));
+            retry++;
+        }
+
+        ESP_LOGD(TAG, "Chunk read attempt: offset=%u to_read=%u got=%u retries=%d",
+                 (unsigned)bytes_read, (unsigned)to_read, (unsigned)got, retry);
+
+        if (got == 0) {
+            ESP_LOGE(TAG, "Failed to read chunk after retries (read %u/%u bytes)",
+                     (unsigned)bytes_read, (unsigned)length);
+            heap_caps_free(tmp_buf);
+            heap_caps_free(*image_data);
+            *image_data = NULL;
+            return false;
+        }
+
+        memcpy(*image_data + bytes_read, tmp_buf, got);
+        bytes_read += got;
+    }
+
+    heap_caps_free(tmp_buf);
+
+    if (bytes_read != length) {
+        ESP_LOGE(TAG, "Incomplete read: %u/%u", (unsigned)bytes_read, (unsigned)length);
+        heap_caps_free(*image_data);
+        *image_data = NULL;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Image captured successfully: %u bytes", (unsigned)length);
+
+    // For simplicity, we'll send image directly to API without local storage
+    // Free the allocated buffer since we won't use it
+    if (*image_data) {
+        heap_caps_free(*image_data);
+        *image_data = NULL;
+    }
+
     return true;
 }
 
@@ -538,8 +753,283 @@ static void recognize_food(float weight, meal_log_t *meal) {
         meal->carbs = 15.4f;
         meal->fat = 0.2f;
     }
-    
+
     ESP_LOGI(TAG, "Food recognized: %s (%.1fg)", meal->food_name, weight);
+}
+
+// Forward declaration for multipart upload function
+static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, float weight);
+
+// Upload function that reads image into memory first, then sends (reliable approach)
+static esp_err_t send_image_to_server_buffered(size_t image_size, float weight) {
+    ESP_LOGI(TAG, "Starting buffered image upload: %zu bytes", image_size);
+
+    // Wait for camera to be ready for reading (like in working camera project)
+    const TickType_t wait_tick = pdMS_TO_TICKS(50);
+    const int max_wait_cycles = 40; // 40 * 50ms = 2s total wait
+    int wait_count = 0;
+    uint32_t available_length = 0;
+
+    ESP_LOGI(TAG, "Waiting for camera to be ready...");
+    while (wait_count < max_wait_cycles) {
+        captureThread(&myCAM); // drive camera state machine
+        vTaskDelay(wait_tick);
+        available_length = imageAvailable(&myCAM);
+        if (available_length > 0) break;
+        wait_count++;
+    }
+
+    if (available_length == 0) {
+        ESP_LOGE(TAG, "Camera not ready for reading after timeout");
+        return ESP_FAIL;
+    }
+
+    if (available_length != image_size) {
+        ESP_LOGW(TAG, "Available length (%u) != expected size (%zu), using available length",
+                 (unsigned)available_length, image_size);
+        image_size = available_length;
+    }
+
+    // Allocate buffer for complete image (try PSRAM first, then regular heap)
+    uint8_t *image_data = heap_caps_malloc(image_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!image_data) {
+        ESP_LOGW(TAG, "PSRAM allocation failed for image buffer (%zu bytes), trying regular heap", image_size);
+        image_data = heap_caps_malloc(image_size, MALLOC_CAP_8BIT);
+        if (!image_data) {
+            ESP_LOGE(TAG, "Failed to allocate regular heap for image buffer (%zu bytes)", image_size);
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "Allocated image buffer in regular heap: %zu bytes", image_size);
+    } else {
+        ESP_LOGI(TAG, "Allocated image buffer in PSRAM: %zu bytes", image_size);
+    }
+
+    // Read image in chunks (like in camera project)
+    const uint32_t chunk_size = 1024; // 1KB chunks
+    uint8_t *tmp_buf = heap_caps_malloc(chunk_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tmp_buf) {
+        ESP_LOGW(TAG, "PSRAM allocation failed for temp buffer, trying regular heap");
+        tmp_buf = heap_caps_malloc(chunk_size, MALLOC_CAP_8BIT);
+        if (!tmp_buf) {
+            ESP_LOGE(TAG, "Failed to allocate temporary buffer");
+            heap_caps_free(image_data);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    uint32_t bytes_read = 0;
+    while (bytes_read < image_size) {
+        uint32_t remaining = image_size - bytes_read;
+        uint32_t to_read = (remaining > chunk_size) ? chunk_size : remaining;
+
+        uint8_t got = 0;
+        int retry = 0;
+        const int max_read_retries = 5;
+
+        while (retry < max_read_retries) {
+            captureThread(&myCAM);
+            got = readBuff(&myCAM, tmp_buf, (uint8_t)to_read);
+            if (got > 0) break;
+            vTaskDelay(pdMS_TO_TICKS(10 + retry*5));
+            retry++;
+        }
+
+        ESP_LOGD(TAG, "Read chunk: offset=%u to_read=%u got=%u retries=%d",
+                 (unsigned)bytes_read, (unsigned)to_read, (unsigned)got, retry);
+
+        if (got == 0) {
+            ESP_LOGE(TAG, "Failed to read chunk after retries (read %u/%u bytes)",
+                     (unsigned)bytes_read, (unsigned)image_size);
+            heap_caps_free(tmp_buf);
+            heap_caps_free(image_data);
+            return ESP_FAIL;
+        }
+
+        memcpy(image_data + bytes_read, tmp_buf, got);
+        bytes_read += got;
+    }
+
+    heap_caps_free(tmp_buf);
+
+    if (bytes_read != image_size) {
+        ESP_LOGE(TAG, "Incomplete read: %u/%u bytes", (unsigned)bytes_read, (unsigned)image_size);
+        heap_caps_free(image_data);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Image read into buffer successfully: %u bytes", (unsigned)image_size);
+
+    // Now send the buffered image using the proven multipart approach
+    esp_err_t result = send_image_to_server(image_data, image_size, weight);
+
+    // Clean up
+    heap_caps_free(image_data);
+
+    return result;
+}
+
+/* -------------------------------------------------------------------
+ * HTTP Upload Functions
+ * -------------------------------------------------------------------*/
+static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, float weight)
+{
+    const char *url = UPLOAD_URL;
+    const char *auth_header_value = AUTH_HEADER_VALUE;
+    const char *timestamp_value = "2024-01-15T12:30:00Z";
+    char weight_value[32];
+    char user_id_value[32] = "11";
+    const char *file_field_name = "image_file";
+    const char *file_name = "capture.jpg";
+    const char *file_mime = "image/jpeg";
+    const char *boundary = "----ESP32FormBoundary7MA4YWxkTrZu0gW";
+
+    // Convert weight to string
+    snprintf(weight_value, sizeof(weight_value), "%.1f", weight);
+
+    // Prepare lengths for parts
+    char header_part[512];
+    int n;
+
+    // We'll construct the body in PSRAM to avoid internal heap fragmentation
+    // Compute exact size:
+    size_t total_size = 0;
+
+    // text parts
+    n = snprintf(header_part, sizeof(header_part),
+                 "--%s\r\n"
+                 "Content-Disposition: form-data; name=\"timestamp\"\r\n\r\n"
+                 "%s\r\n",
+                 boundary, timestamp_value);
+    if (n < 0) return ESP_ERR_INVALID_ARG;
+    total_size += (size_t)n;
+
+    n = snprintf(header_part, sizeof(header_part),
+                 "--%s\r\n"
+                 "Content-Disposition: form-data; name=\"weight_g\"\r\n\r\n"
+                 "%s\r\n",
+                 boundary, weight_value);
+    if (n < 0) return ESP_ERR_INVALID_ARG;
+    total_size += (size_t)n;
+
+    n = snprintf(header_part, sizeof(header_part),
+                 "--%s\r\n"
+                 "Content-Disposition: form-data; name=\"user_id\"\r\n\r\n"
+                 "%s\r\n",
+                 boundary, user_id_value);
+    if (n < 0) return ESP_ERR_INVALID_ARG;
+    total_size += (size_t)n;
+
+    // file header
+    char file_header[512];
+    n = snprintf(file_header, sizeof(file_header),
+                 "--%s\r\n"
+                 "Content-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+                 "Content-Type: %s\r\n\r\n",
+                 boundary, file_field_name, file_name, file_mime);
+    if (n < 0) return ESP_ERR_INVALID_ARG;
+    size_t file_header_len = (size_t)n;
+    total_size += file_header_len;
+
+    // file binary length
+    total_size += jpeg_len;
+
+    // ending boundary
+    char ending[64];
+    n = snprintf(ending, sizeof(ending), "\r\n--%s--\r\n", boundary);
+    if (n < 0) return ESP_ERR_INVALID_ARG;
+    size_t ending_len = (size_t)n;
+    total_size += ending_len;
+
+    // allocate body in PSRAM
+    uint8_t *body = heap_caps_malloc(total_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!body) {
+        ESP_LOGE(TAG, "Failed to allocate PSRAM for multipart body size=%u", (unsigned)total_size);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Fill body (carefully)
+    size_t offset = 0;
+    int m;
+
+    m = snprintf((char*)body + offset, 256,
+                 "--%s\r\n"
+                 "Content-Disposition: form-data; name=\"timestamp\"\r\n\r\n"
+                 "%s\r\n", boundary, timestamp_value);
+    if (m < 0) { heap_caps_free(body); return ESP_FAIL; }
+    offset += (size_t)m;
+
+    m = snprintf((char*)body + offset, 256,
+                 "--%s\r\n"
+                 "Content-Disposition: form-data; name=\"weight_g\"\r\n\r\n"
+                 "%s\r\n", boundary, weight_value);
+    if (m < 0) { heap_caps_free(body); return ESP_FAIL; }
+    offset += (size_t)m;
+
+    m = snprintf((char*)body + offset, 256,
+                 "--%s\r\n"
+                 "Content-Disposition: form-data; name=\"user_id\"\r\n\r\n"
+                 "%s\r\n", boundary, user_id_value);
+    if (m < 0) { heap_caps_free(body); return ESP_FAIL; }
+    offset += (size_t)m;
+
+    // file header
+    memcpy(body + offset, file_header, file_header_len);
+    offset += file_header_len;
+
+    // file data
+    memcpy(body + offset, jpeg, jpeg_len);
+    offset += jpeg_len;
+
+    // ending
+    memcpy(body + offset, ending, ending_len);
+    offset += ending_len;
+
+    if (offset != total_size) {
+        ESP_LOGW(TAG, "constructed multipart size mismatch (offset=%u total=%u)", (unsigned)offset, (unsigned)total_size);
+    }
+
+    // Prepare HTTP client
+    esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = 15000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "esp_http_client_init failed");
+        heap_caps_free(body);
+        return ESP_FAIL;
+    }
+
+    // Headers
+    char content_type_hdr[128];
+    snprintf(content_type_hdr, sizeof(content_type_hdr), "multipart/form-data; boundary=%s", boundary);
+    esp_http_client_set_header(client, "Content-Type", content_type_hdr);
+    esp_http_client_set_header(client, "Authorization", auth_header_value);
+    esp_http_client_set_header(client, "Accept", "application/json");
+
+    // Set POST body
+    esp_err_t err = esp_http_client_set_post_field(client, (const char*)body, total_size);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_http_client_set_post_field failed: %d", err);
+        esp_http_client_cleanup(client);
+        heap_caps_free(body);
+        return err;
+    }
+
+    // Perform POST
+    err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        int content_length = esp_http_client_get_content_length(client);
+        ESP_LOGI(TAG, "Upload finished. HTTP status = %d, content_length = %d", status, content_length);
+    } else {
+        ESP_LOGE(TAG, "HTTP POST failed: %d", err);
+    }
+
+    esp_http_client_cleanup(client);
+    heap_caps_free(body);
+
+    return err;
 }
 
 /* -------------------------------------------------------------------
@@ -560,31 +1050,40 @@ static void btn_record_meal_handler(lv_event_t *e) {
 static void btn_capture_handler(lv_event_t *e) {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
         ESP_LOGI(TAG, "Capture button clicked");
-        
+
         // Get current weight
         current_meal.weight = hx711_get_weight();
-        
+
         if (current_meal.weight < 1.0f) {
             ESP_LOGW(TAG, "No item detected on scale");
             return;
         }
-        
-        // Capture image
-        if (!capture_image(&current_meal.image_data, &current_meal.image_size)) {
+
+        // Capture image (simplified - no local storage)
+        if (!capture_image_simple(&current_meal.image_size)) {
             ESP_LOGE(TAG, "Failed to capture image");
             return;
         }
-        
-        // Recognize food
+
+        // Upload image to API with weight data (buffered)
+        esp_err_t upload_err = send_image_to_server_buffered(current_meal.image_size, current_meal.weight);
+        if (upload_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to upload image to API: %d", upload_err);
+            // Continue to show results even if upload failed
+        } else {
+            ESP_LOGI(TAG, "Image uploaded successfully to API");
+        }
+
+        // Recognize food (simulation for now)
         recognize_food(current_meal.weight, &current_meal);
-        
+
         // Update result screen labels
         lv_label_set_text(result_food_label, current_meal.food_name);
-        
+
         char weight_str[64];
         snprintf(weight_str, sizeof(weight_str), "Weight: %.1f g", current_meal.weight);
         lv_label_set_text(result_weight_label, weight_str);
-        
+
         char nutrition_str[256];
         snprintf(nutrition_str, sizeof(nutrition_str),
                 "Calories: %d kcal\n\n"
@@ -596,10 +1095,10 @@ static void btn_capture_handler(lv_event_t *e) {
                 current_meal.carbs,
                 current_meal.fat);
         lv_label_set_text(result_nutrition_label, nutrition_str);
-        
+
         // Switch to result screen
         lv_screen_load(screen_result);
-        
+
         // Draw simulated food image on canvas (after screen is loaded)
         vTaskDelay(pdMS_TO_TICKS(50));
         draw_simulated_food_image(current_meal.weight);
@@ -735,47 +1234,26 @@ static void create_result_screen(void) {
     lv_obj_set_style_text_color(title, lv_color_hex(0x00FF88), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
     
-    // LEFT SIDE - Canvas for captured image
-    if (canvas_buffer) {
-        result_image_canvas = lv_canvas_create(screen_result);
-        lv_canvas_set_buffer(result_image_canvas, canvas_buffer, 
-                            CANVAS_WIDTH, CANVAS_HEIGHT, LV_COLOR_FORMAT_RGB565);
-        lv_obj_align(result_image_canvas, LV_ALIGN_TOP_LEFT, 20, 50);
-        
-        // Add border to canvas
-        lv_obj_set_style_border_width(result_image_canvas, 2, LV_PART_MAIN);
-        lv_obj_set_style_border_color(result_image_canvas, lv_color_hex(0x667EEA), LV_PART_MAIN);
-        lv_obj_set_style_radius(result_image_canvas, 8, LV_PART_MAIN);
-        
-        // Initially fill with placeholder
-        lv_color_t bg_color = lv_color_hex(0x1A1F3A);
-        lv_color_t icon_color = lv_color_hex(0x667EEA);
-        
-        for (int i = 0; i < CANVAS_WIDTH * CANVAS_HEIGHT; i++) {
-            canvas_buffer[i] = bg_color;
-        }
-        
-        // Draw simple camera icon
-        int icon_x = CANVAS_WIDTH / 2;
-        int icon_y = CANVAS_HEIGHT / 2;
-        
-        for (int y = icon_y - 15; y < icon_y + 15; y++) {
-            for (int x = icon_x - 15; x < icon_x + 15; x++) {
-                if (y >= 0 && y < CANVAS_HEIGHT && x >= 0 && x < CANVAS_WIDTH) {
-                    int dx = x - icon_x;
-                    int dy = y - icon_y;
-                    int dist_sq = dx * dx + dy * dy;
-                    
-                    if (dist_sq <= 12 * 12 && dist_sq >= 8 * 8) {
-                        canvas_buffer[y * CANVAS_WIDTH + x] = icon_color;
-                    }
-                }
-            }
-        }
-    } else {
-        ESP_LOGE(TAG, "Canvas buffer not allocated");
-        return;
-    }
+    // LEFT SIDE - Status indicator instead of image
+    lv_obj_t *status_card = lv_obj_create(screen_result);
+    lv_obj_set_size(status_card, 120, 80);
+    lv_obj_align(status_card, LV_ALIGN_TOP_LEFT, 20, 50);
+    lv_obj_set_style_bg_color(status_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
+    lv_obj_set_style_border_width(status_card, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(status_card, lv_color_hex(0x667EEA), LV_PART_MAIN);
+    lv_obj_set_style_radius(status_card, 8, LV_PART_MAIN);
+
+    lv_obj_t *status_icon = lv_label_create(status_card);
+    lv_label_set_text(status_icon, LV_SYMBOL_OK);
+    lv_obj_set_style_text_font(status_icon, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(status_icon, lv_color_hex(0x00FF88), 0);
+    lv_obj_center(status_icon);
+
+    lv_obj_t *status_label = lv_label_create(screen_result);
+    lv_label_set_text(status_label, "Image\nCaptured");
+    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(status_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 20, 140);
     
     // LEFT SIDE - Food name (below image)
     result_food_label = lv_label_create(screen_result);
@@ -833,19 +1311,24 @@ static void create_result_screen(void) {
 }
 
 /* -------------------------------------------------------------------
+ * Camera maintenance task
+ * -------------------------------------------------------------------*/
+static void camera_task(void *arg) {
+    while (1) {
+        captureThread(&myCAM); // ensures internal camera processing
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+/* -------------------------------------------------------------------
  * LVGL handler task
  * -------------------------------------------------------------------*/
 static void lvgl_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(100));
     
-    // Allocate canvas buffer (120x90x2 = 21,600 bytes)
-    canvas_buffer = heap_caps_malloc(CANVAS_WIDTH * CANVAS_HEIGHT * sizeof(lv_color_t), MALLOC_CAP_8BIT);
-    if (!canvas_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate canvas buffer");
-        vTaskDelete(NULL);
-        return;
-    }
-    ESP_LOGI(TAG, "Canvas buffer allocated: %d bytes", CANVAS_WIDTH * CANVAS_HEIGHT * sizeof(lv_color_t));
+    // Skip canvas buffer allocation to save memory for API calls
+    ESP_LOGI(TAG, "Skipping canvas buffer allocation to conserve memory for API calls");
+    canvas_buffer = NULL;
     
     // Create all screens
     create_home_screen();
@@ -877,7 +1360,22 @@ static void lvgl_task(void *arg) {
  * -------------------------------------------------------------------*/
 void app_main(void) {
     ESP_LOGI(TAG, "Starting Smart Plate System");
-    
+
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // UART for debug
+    uartBegin(115200);
+
+    // WiFi
+    ESP_LOGI(TAG, "Initializing WiFi...");
+    wifi_init_sta();
+
     // Check available memory
     ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
     ESP_LOGI(TAG, "Free PSRAM: %lu bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -894,8 +1392,16 @@ void app_main(void) {
     
     // Initialize HX711
     hx711_init();
+
+    // Initial tare with balanced samples for stability and speed
     hx711_tare(20);
     ESP_LOGI(TAG, "HX711 initialized");
+
+    // Initialize camera (like working camera - SPI init handled inside begin())
+    ESP_LOGI(TAG, "Initializing camera...");
+    myCAM = createArducamCamera(CAMERA_CS);
+    begin(&myCAM);
+    ESP_LOGI(TAG, "Camera initialized");
     
     // Initialize I2C for touch controller
     ESP_ERROR_CHECK(i2c_master_init());
@@ -941,16 +1447,95 @@ void app_main(void) {
     esp_timer_create(&tick_args, &tmr);
     esp_timer_start_periodic(tmr, 1000);
 
-    // Allocate buffers
-    rgb666_buf = heap_caps_malloc(RGB666_BUF_SIZE, MALLOC_CAP_DMA);
+    // Allocate buffers - try allocating as single block first to reduce fragmentation
     size_t lvgl_buf_size = BUF_PIXELS * sizeof(lv_color_t);
-    lv_buf1 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_DMA);
-    lv_buf2 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_DMA);
+    size_t total_buf_size = RGB666_BUF_SIZE + (lvgl_buf_size * 2);
+    size_t free_heap_before = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "Free heap before buffer allocation: %zu bytes", free_heap_before);
+    ESP_LOGI(TAG, "Total buffer size needed: %zu bytes (rgb666: %zu, lv_buf1: %zu, lv_buf2: %zu)", 
+             total_buf_size, RGB666_BUF_SIZE, lvgl_buf_size, lvgl_buf_size);
     
-    if (!rgb666_buf || !lv_buf1 || !lv_buf2) {
-        ESP_LOGE(TAG, "Failed to allocate buffers");
-        return;
+    // Try allocating all buffers as a single contiguous block first (reduces fragmentation)
+    uint8_t *combined_buf = NULL;
+    combined_buf = heap_caps_malloc(total_buf_size, MALLOC_CAP_DMA);
+    if (!combined_buf) {
+        ESP_LOGW(TAG, "DMA allocation failed for combined buffer (%zu bytes), trying regular heap", total_buf_size);
+        combined_buf = heap_caps_malloc(total_buf_size, MALLOC_CAP_8BIT);
     }
+    
+    if (combined_buf) {
+        // Successfully allocated as single block - split it up
+        ESP_LOGI(TAG, "Allocated combined buffer: %zu bytes", total_buf_size);
+        rgb666_buf = combined_buf;
+        lv_buf1 = (lv_color_t *)(combined_buf + RGB666_BUF_SIZE);
+        lv_buf2 = (lv_color_t *)(combined_buf + RGB666_BUF_SIZE + lvgl_buf_size);
+        ESP_LOGI(TAG, "Split combined buffer into rgb666_buf, lv_buf1, lv_buf2");
+    } else {
+        // Fallback: try individual allocations
+        ESP_LOGW(TAG, "Combined allocation failed, trying individual allocations");
+        
+        rgb666_buf = heap_caps_malloc(RGB666_BUF_SIZE, MALLOC_CAP_DMA);
+        if (!rgb666_buf) {
+            ESP_LOGW(TAG, "DMA allocation failed for rgb666_buf (%zu bytes), trying regular heap", RGB666_BUF_SIZE);
+            rgb666_buf = heap_caps_malloc(RGB666_BUF_SIZE, MALLOC_CAP_8BIT);
+        }
+        if (!rgb666_buf) {
+            ESP_LOGE(TAG, "Failed to allocate rgb666_buf (%zu bytes). Free heap: %zu", RGB666_BUF_SIZE, esp_get_free_heap_size());
+            return;
+        }
+        ESP_LOGI(TAG, "rgb666_buf allocated: %zu bytes", RGB666_BUF_SIZE);
+        
+        lv_buf1 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_DMA);
+        if (!lv_buf1) {
+            ESP_LOGW(TAG, "DMA allocation failed for lv_buf1 (%zu bytes), trying regular heap", lvgl_buf_size);
+            lv_buf1 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_8BIT);
+        }
+        if (!lv_buf1) {
+            ESP_LOGE(TAG, "Failed to allocate lv_buf1 (%zu bytes). Free heap: %zu", lvgl_buf_size, esp_get_free_heap_size());
+            heap_caps_free(rgb666_buf);
+            rgb666_buf = NULL;
+            return;
+        }
+        ESP_LOGI(TAG, "lv_buf1 allocated: %zu bytes", lvgl_buf_size);
+        
+        // Try allocating lv_buf2 - if it fails, try freeing and reallocating in different order
+        lv_buf2 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_DMA);
+        if (!lv_buf2) {
+            ESP_LOGW(TAG, "DMA allocation failed for lv_buf2 (%zu bytes), trying regular heap", lvgl_buf_size);
+            lv_buf2 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_8BIT);
+        }
+        
+        // If still failing, try freeing lv_buf1 and reallocating both together
+        if (!lv_buf2) {
+            ESP_LOGW(TAG, "Direct allocation failed, trying reallocation strategy");
+            heap_caps_free(lv_buf1);
+            lv_buf1 = NULL;
+            
+            // Try allocating both lv buffers together
+            size_t two_buf_size = lvgl_buf_size * 2;
+            uint8_t *two_bufs = heap_caps_malloc(two_buf_size, MALLOC_CAP_DMA);
+            if (!two_bufs) {
+                two_bufs = heap_caps_malloc(two_buf_size, MALLOC_CAP_8BIT);
+            }
+            
+            if (two_bufs) {
+                lv_buf1 = (lv_color_t *)two_bufs;
+                lv_buf2 = (lv_color_t *)(two_bufs + lvgl_buf_size);
+                ESP_LOGI(TAG, "Allocated lv_buf1 and lv_buf2 together: %zu bytes each", lvgl_buf_size);
+            } else {
+                ESP_LOGE(TAG, "Failed to allocate lv_buf2 (%zu bytes). Free heap: %zu", lvgl_buf_size, esp_get_free_heap_size());
+                heap_caps_free(rgb666_buf);
+                rgb666_buf = NULL;
+                return;
+            }
+        } else {
+            ESP_LOGI(TAG, "lv_buf2 allocated: %zu bytes", lvgl_buf_size);
+        }
+    }
+    
+    size_t free_heap_after = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "All buffers allocated. Free heap after: %zu bytes (used: %zu)", 
+             free_heap_after, free_heap_before - free_heap_after);
     
     ESP_LOGI(TAG, "Buffers allocated");
 
@@ -969,5 +1554,9 @@ void app_main(void) {
     // Create LVGL task
     xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8192, NULL, 5, NULL, 1);
 
+    // Create camera maintenance task
+    xTaskCreatePinnedToCore(camera_task, "camera_task", 4096, NULL, 4, NULL, 1);
+
     ESP_LOGI(TAG, "Smart Plate System Ready!");
 }
+
