@@ -9,7 +9,6 @@
 #include "driver/i2c.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
-#include "esp_random.h"
 #include "esp_rom_sys.h"
 #include <string.h>
 #include <stdio.h>
