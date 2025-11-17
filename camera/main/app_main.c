@@ -25,19 +25,12 @@
 #define MAXIMUM_RETRY 5
 
 // ---- HTTP upload config (change URL/token) ----
-// Example: LAN URL (recommended while developing): http://192.168.1.42:8000/api/v1/meal_logs/
-// Example: ngrok HTTPS URL: https://<your-ngrok-id>.ngrok-free.app/api/v1/meal_logs/
-static const char *UPLOAD_URL = "http://192.168.0.4:8000/api/v1/meal_logs/"; // <-- CHANGE THIS
+static const char *UPLOAD_URL = "http://192.168.0.6:8000/api/v1/meal_logs/";
 static const char *AUTH_HEADER_VALUE = "Bearer iKnCz7E2Mtfl_V0bDcasJWDMzVN39L_BCySvj1hLDSc";
-
-// If you plan to use HTTPS (ngrok), you'll likely need the server CA certificate compiled in and set:
-// static const char server_root_cert_pem[] = "-----BEGIN CERTIFICATE-----\n....\n-----END CERTIFICATE-----\n";
-// Then set .cert_pem = server_root_cert_pem in esp_http_client_config_t
-// (I left it out to avoid accidentally breaking TLS validation.)
 
 // ---- Camera globals ----
 ArducamCamera myCAM;
-const int CS_PIN = 33; // chip select
+const int CS_PIN = 33;
 static httpd_handle_t server = NULL;
 
 // WiFi event group
@@ -81,7 +74,6 @@ void wifi_init_sta(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // Register events
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
@@ -95,7 +87,6 @@ void wifi_init_sta(void)
                                                         NULL,
                                                         &instance_got_ip));
 
-    // Configure and start WiFi
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
@@ -126,15 +117,42 @@ void wifi_init_sta(void)
 
 /* ---------- Helper: POST multipart/form-data ---------- */
 
-/*
-  send_image_to_server()
-  - Builds a multipart/form-data body in PSRAM
-  - Fields hardcoded to match your curl example (timestamp, weight_g, user_id)
-  - Posts the JPEG as field name image_file, filename capture.jpg
-*/
+// Structure to hold response data
+typedef struct {
+    char *buffer;
+    int len;
+    int max_len;
+} response_buffer_t;
+
+// HTTP event handler to capture response
+static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+{
+    response_buffer_t *resp = (response_buffer_t *)evt->user_data;
+    
+    switch(evt->event_id) {
+        case HTTP_EVENT_ON_DATA:
+            // Append received data to our buffer
+            if (resp && resp->buffer && evt->data_len > 0) {
+                int copy_len = evt->data_len;
+                if (resp->len + copy_len >= resp->max_len) {
+                    copy_len = resp->max_len - resp->len - 1;
+                }
+                if (copy_len > 0) {
+                    memcpy(resp->buffer + resp->len, evt->data, copy_len);
+                    resp->len += copy_len;
+                    resp->buffer[resp->len] = 0;
+                }
+            }
+            break;
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
 {
-    const char *url = UPLOAD_URL; // change at top of file
+    const char *url = UPLOAD_URL;
     const char *auth_header_value = AUTH_HEADER_VALUE;
 
     const char *timestamp_value = "2024-01-15T12:30:00Z";
@@ -143,17 +161,13 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
     const char *file_field_name = "image_file";
     const char *file_name = "capture.jpg";
     const char *file_mime = "image/jpeg";
-    const char *boundary = "----ESP32FormBoundary7MA4YWxkTrZu0gW"; // chosen safe boundary
+    const char *boundary = "----ESP32FormBoundary7MA4YWxkTrZu0gW";
 
-    // Prepare lengths for parts
     char header_part[512];
     int n;
-
-    // We'll construct the body in PSRAM to avoid internal heap fragmentation
-    // Compute exact size:
     size_t total_size = 0;
 
-    // text parts
+    // Calculate text parts size
     n = snprintf(header_part, sizeof(header_part),
                  "--%s\r\n"
                  "Content-Disposition: form-data; name=\"timestamp\"\r\n\r\n"
@@ -178,7 +192,7 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
     if (n < 0) return ESP_ERR_INVALID_ARG;
     total_size += (size_t)n;
 
-    // file header
+    // File header
     char file_header[512];
     n = snprintf(file_header, sizeof(file_header),
                  "--%s\r\n"
@@ -189,24 +203,23 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
     size_t file_header_len = (size_t)n;
     total_size += file_header_len;
 
-    // file binary length
     total_size += jpeg_len;
 
-    // ending boundary
+    // Ending boundary
     char ending[64];
     n = snprintf(ending, sizeof(ending), "\r\n--%s--\r\n", boundary);
     if (n < 0) return ESP_ERR_INVALID_ARG;
     size_t ending_len = (size_t)n;
     total_size += ending_len;
 
-    // allocate body in PSRAM
+    // Allocate body in PSRAM
     uint8_t *body = heap_caps_malloc(total_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!body) {
         ESP_LOGE(TAG, "Failed to allocate PSRAM for multipart body size=%u", (unsigned)total_size);
         return ESP_ERR_NO_MEM;
     }
 
-    // Fill body (carefully)
+    // Fill body
     size_t offset = 0;
     int m;
 
@@ -231,41 +244,54 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
     if (m < 0) { heap_caps_free(body); return ESP_FAIL; }
     offset += (size_t)m;
 
-    // file header
     memcpy(body + offset, file_header, file_header_len);
     offset += file_header_len;
 
-    // file data
     memcpy(body + offset, jpeg, jpeg_len);
     offset += jpeg_len;
 
-    // ending
     memcpy(body + offset, ending, ending_len);
     offset += ending_len;
 
     if (offset != total_size) {
-        ESP_LOGW(TAG, "constructed multipart size mismatch (offset=%u total=%u)", (unsigned)offset, (unsigned)total_size);
+        ESP_LOGW(TAG, "constructed multipart size mismatch (offset=%u total=%u)", 
+                 (unsigned)offset, (unsigned)total_size);
     }
 
-    // Prepare HTTP client
+    // Allocate response buffer
+    response_buffer_t response;
+    response.max_len = 4096;
+    response.buffer = heap_caps_malloc(response.max_len, MALLOC_CAP_8BIT);
+    response.len = 0;
+    
+    if (!response.buffer) {
+        ESP_LOGE(TAG, "Failed to allocate response buffer");
+        heap_caps_free(body);
+        return ESP_ERR_NO_MEM;
+    }
+    response.buffer[0] = 0;
+
+    // Prepare HTTP client with event handler
     esp_http_client_config_t config = {
         .url = url,
+        .method = HTTP_METHOD_POST,
         .timeout_ms = 15000,
-        // If you plan to use HTTPS and have a cert compiled in:
-        // .cert_pem = server_root_cert_pem,
-        // optionally set .transport_type depending on IDF version
+        .event_handler = _http_event_handler,
+        .user_data = &response,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         ESP_LOGE(TAG, "esp_http_client_init failed");
+        heap_caps_free(response.buffer);
         heap_caps_free(body);
         return ESP_FAIL;
     }
 
-    // Headers
+    // Set headers
     char content_type_hdr[128];
-    snprintf(content_type_hdr, sizeof(content_type_hdr), "multipart/form-data; boundary=%s", boundary);
+    snprintf(content_type_hdr, sizeof(content_type_hdr), 
+             "multipart/form-data; boundary=%s", boundary);
     esp_http_client_set_header(client, "Content-Type", content_type_hdr);
     esp_http_client_set_header(client, "Authorization", auth_header_value);
     esp_http_client_set_header(client, "Accept", "application/json");
@@ -275,24 +301,29 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_http_client_set_post_field failed: %d", err);
         esp_http_client_cleanup(client);
+        heap_caps_free(response.buffer);
         heap_caps_free(body);
         return err;
     }
 
-    // Perform POST
+    // Perform POST (response will be captured by event handler)
     err = esp_http_client_perform(client);
+    
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         int content_length = esp_http_client_get_content_length(client);
-        ESP_LOGI(TAG, "Upload finished. HTTP status = %d, content_length = %d", status, content_length);
-
-        // Optionally, read response body to buffer here if you want to parse it
-        // (use esp_http_client_read_response if desired)
+    
+        ESP_LOGI(TAG, "Upload finished. HTTP status = %d, content_length = %d",
+                 status, content_length);
+        
+        // Log the response captured by event handler
+        ESP_LOGI(TAG, "FastAPI Response (%d bytes): %s", response.len, response.buffer);
     } else {
         ESP_LOGE(TAG, "HTTP POST failed: %d", err);
     }
 
     esp_http_client_cleanup(client);
+    heap_caps_free(response.buffer);
     heap_caps_free(body);
     return err;
 }
@@ -312,23 +343,14 @@ static esp_err_t root_handler(httpd_req_t *req)
 
 static esp_err_t favicon_handler(httpd_req_t *req)
 {
-    // Return empty response for favicon.ico to prevent 404 errors
     httpd_resp_set_type(req, "image/x-icon");
     return httpd_resp_send(req, "", 0);
 }
 
-/*
-  capture_handler:
-  - Takes a picture (VGA JPEG),
-  - Reads image into PSRAM,
-  - Sends it to your backend via send_image_to_server(),
-  - Responds to browser with the JPEG inline (so /capture still works)
-*/
 static esp_err_t capture_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Capture request received");
 
-    // Trigger capture (VGA JPEG)
     CamStatus status = takePicture(&myCAM, CAM_IMAGE_MODE_VGA, CAM_IMAGE_PIX_FMT_JPG);
     if (status != CAM_ERR_SUCCESS) {
         ESP_LOGE(TAG, "Failed to take picture, status: %d", status);
@@ -336,15 +358,14 @@ static esp_err_t capture_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // Wait until imageAvailable() reports a length or timeout
     const TickType_t wait_tick = pdMS_TO_TICKS(50);
-    const int max_wait_cycles = 40; // 40 * 50ms = 2s total wait
+    const int max_wait_cycles = 40;
     int wait_count = 0;
     uint32_t image_length = 0;
 
     ESP_LOGI(TAG, "Waiting for image to be ready...");
     while (wait_count < max_wait_cycles) {
-        captureThread(&myCAM); // drive camera state machine
+        captureThread(&myCAM);
         vTaskDelay(wait_tick);
         image_length = imageAvailable(&myCAM);
         if (image_length > 0) break;
@@ -365,7 +386,6 @@ static esp_err_t capture_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Image length: %u bytes", (unsigned)image_length);
 
-    // Allocate PSRAM buffer for image
     uint8_t *image_data = heap_caps_malloc(image_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!image_data) {
         ESP_LOGE(TAG, "Failed to allocate PSRAM for image!");
@@ -373,8 +393,7 @@ static esp_err_t capture_handler(httpd_req_t *req)
         return ESP_ERR_NO_MEM;
     }
 
-    // Read image in small chunks (<=255) because many readBuff implementations use uint8_t length
-    const uint32_t chunk_size = 200; // MUST be <= 255
+    const uint32_t chunk_size = 200;
     uint8_t *tmp_buf = heap_caps_malloc(chunk_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!tmp_buf) {
         ESP_LOGE(TAG, "Failed to allocate tmp buffer!");
@@ -388,24 +407,16 @@ static esp_err_t capture_handler(httpd_req_t *req)
         uint32_t remaining = image_length - bytes_read;
         uint32_t to_read = (remaining > chunk_size) ? chunk_size : remaining;
 
-        // readBuff typically returns uint8_t (0..255)
         uint8_t got = 0;
         int retry = 0;
         const int max_read_retries = 5;
         while (retry < max_read_retries) {
-            // Ensure camera FSM runs in between attempts
             captureThread(&myCAM);
-
             got = readBuff(&myCAM, tmp_buf, (uint8_t)to_read);
             if (got > 0) break;
-
-            // if got == 0, wait a bit and retry
             vTaskDelay(pdMS_TO_TICKS(10 + retry*5));
             retry++;
         }
-
-        ESP_LOGD(TAG, "Chunk read attempt: offset=%u to_read=%u got=%u retries=%d",
-                 (unsigned)bytes_read, (unsigned)to_read, (unsigned)got, retry);
 
         if (got == 0) {
             ESP_LOGE(TAG, "Failed to read chunk after retries (read %u/%u bytes)",
@@ -429,16 +440,13 @@ static esp_err_t capture_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // Upload to backend (blocking) — you can move this into a worker task if you want non-blocking server responses.
     esp_err_t post_err = send_image_to_server(image_data, image_length);
     if (post_err != ESP_OK) {
         ESP_LOGW(TAG, "send_image_to_server failed: %d", post_err);
-        // continue to serve the image to the browser even if upload failed
     } else {
         ESP_LOGI(TAG, "Image uploaded to backend successfully");
     }
 
-    // Serve image to browser
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=\"capture.jpg\"");
     char cl_hdr[32];
@@ -453,7 +461,6 @@ static esp_err_t capture_handler(httpd_req_t *req)
     heap_caps_free(image_data);
     return err;
 }
-
 
 /* ---------- Start/Stop webserver ---------- */
 
@@ -488,12 +495,8 @@ httpd_handle_t start_webserver(void)
     return NULL;
 }
 
-/* ---------- Cleanup preview / helper ---------- */
-// Keep a simple stop preview function in case other libs call it.
 void stop_preview(void)
 {
-    // You can call camera-specific stop/stream off commands here if needed
-    // Keeping minimal implementation
     ESP_LOGI(TAG, "stop_preview() called");
 }
 
@@ -501,7 +504,6 @@ void stop_preview(void)
 
 void app_main(void)
 {
-    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -510,22 +512,16 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // UART for debug
     uartBegin(115200);
     ESP_LOGI(TAG, "ESP32 Camera Server starting...");
 
-    // WiFi
     ESP_LOGI(TAG, "Initializing WiFi...");
     wifi_init_sta();
 
-    // Camera init
     ESP_LOGI(TAG, "Initializing camera...");
     myCAM = createArducamCamera(CS_PIN);
     begin(&myCAM);
-    // You can register callbacks if you use stream mode; for capture mode we don't need callback
-    // registerCallback(&myCAM, ReadBuffer, 200, stop_preview);
 
-    // Start webserver
     ESP_LOGI(TAG, "Starting web server...");
     server = start_webserver();
     if (server) {
@@ -536,9 +532,8 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to start web server!");
     }
 
-    // Capture thread loop - keep calling captureThread so camera internal state is maintained
     while (1) {
-        captureThread(&myCAM); // ensures internal camera processing; cheap to call frequently
+        captureThread(&myCAM);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
