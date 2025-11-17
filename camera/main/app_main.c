@@ -17,7 +17,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+
+// Display includes
+#include "font6x8.h"
+#include "driver/spi_master.h"
+
 #define TAG "camera_server"
+
+// ---- Display pins ----
+#define PIN_TFT_MOSI   23
+#define PIN_TFT_SCLK   18
+#define PIN_TFT_CS      5
+#define PIN_TFT_DC     13
+#define PIN_TFT_RST     4
 
 // ---- WiFi config (change to your AP) ----
 #define WIFI_SSID "Testpress_4G"
@@ -33,12 +45,204 @@ ArducamCamera myCAM;
 const int CS_PIN = 33;
 static httpd_handle_t server = NULL;
 
+// ---- Display globals ----
+spi_device_handle_t tft_spi = NULL;
+
 // WiFi event group
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
 static int s_retry_num = 0;
+
+// ---- Display functions ----
+void ili9488_send_cmd(uint8_t cmd)
+{
+    gpio_set_level(PIN_TFT_DC, 0);
+    spi_transaction_t t = {0};
+    t.length = 8;
+    t.tx_buffer = &cmd;
+    spi_device_polling_transmit(tft_spi, &t);
+}
+
+void ili9488_send_data(uint8_t data)
+{
+    gpio_set_level(PIN_TFT_DC, 1);
+    spi_transaction_t t = {0};
+    t.length = 8;
+    t.tx_buffer = &data;
+    spi_device_polling_transmit(tft_spi, &t);
+}
+
+void ili9488_init(void)
+{
+    ESP_LOGI(TAG, "Resetting display...");
+    gpio_set_level(PIN_TFT_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(PIN_TFT_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    ESP_LOGI(TAG, "Sending ILI9488 init...");
+
+    ili9488_send_cmd(0x11);     // Sleep Out
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    ili9488_send_cmd(0x36);     // Memory Access Control
+    ili9488_send_data(0xE8);   // Landscape rotation (same as TFT_eSPI rotation=3)
+
+    ili9488_send_cmd(0x3A);     // Pixel Format
+    ili9488_send_data(0x66);    // 18-bit/pixel mode (RGB666)
+
+    ili9488_send_cmd(0x29);     // Display On
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+void drawPixel(int x, int y, uint16_t color565)
+{
+    if (x < 0 || x >= 480 || y < 0 || y >= 320) return;
+
+    uint8_t r5 = (color565 >> 11) & 0x1F;
+    uint8_t g6 = (color565 >> 5) & 0x3F;
+    uint8_t b5 =  color565       & 0x1F;
+
+    uint8_t R = r5 << 3;
+    uint8_t G = g6 << 2;
+    uint8_t B = b5 << 3;
+
+    // Column (0..479)
+    ili9488_send_cmd(0x2A);
+    ili9488_send_data(x >> 8);
+    ili9488_send_data(x & 0xFF);
+    ili9488_send_data(x >> 8);
+    ili9488_send_data(x & 0xFF);
+
+    // Row (0..319)
+    ili9488_send_cmd(0x2B);
+    ili9488_send_data(y >> 8);
+    ili9488_send_data(y & 0xFF);
+    ili9488_send_data(y >> 8);
+    ili9488_send_data(y & 0xFF);
+
+    // Memory write
+    ili9488_send_cmd(0x2C);
+    gpio_set_level(PIN_TFT_DC, 1);
+
+    uint8_t px[3] = {R, G, B};
+
+    spi_transaction_t t = {0};
+    t.length = 24;
+    t.tx_buffer = px;
+
+    spi_device_polling_transmit(tft_spi, &t);
+}
+
+void drawChar(int x, int y, char c, uint16_t color, uint8_t scale)
+{
+    if (c < 32 || c > 126) return;
+
+    const uint8_t *glyph = &font6x8[(c - 32) * 6];
+
+    for (int col = 0; col < 6; col++)
+    {
+        uint8_t line = glyph[col];
+
+        for (int row = 0; row < 8; row++)
+        {
+            if (line & 1)
+            {
+                // Draw a scale x scale block
+                for (int dx = 0; dx < scale; dx++)
+                {
+                    for (int dy = 0; dy < scale; dy++)
+                    {
+                        drawPixel(x + col*scale + dx,
+                                  y + row*scale + dy,
+                                  color);
+                    }
+                }
+            }
+
+            line >>= 1;
+        }
+    }
+}
+
+void drawText(int x, int y, const char *s, uint16_t color, uint8_t scale)
+{
+    while (*s)
+    {
+        drawChar(x, y, *s, color, scale);
+        x += 6 * scale;   // move ahead by scaled width
+        s++;
+    }
+}
+
+void fill_color(uint16_t color565)
+{
+    // 565 → 666 expand
+    uint8_t r5 = (color565 >> 11) & 0x1F;
+    uint8_t g6 = (color565 >> 5) & 0x3F;
+    uint8_t b5 =  color565       & 0x1F;
+
+    uint8_t R = r5 << 3;
+    uint8_t G = g6 << 2;
+    uint8_t B = b5 << 3;
+
+    const int total_pixels  = 480 * 320;
+    const int chunk_pixels  = 1200;
+    const int chunk_bytes   = chunk_pixels * 3;
+
+    uint8_t *buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_DMA);
+    if (!buf) {
+        ESP_LOGE(TAG, "DMA buffer alloc failed");
+        return;
+    }
+
+    for (int i = 0; i < chunk_pixels; i++) {
+        buf[3*i + 0] = R;
+        buf[3*i + 1] = G;
+        buf[3*i + 2] = B;
+    }
+
+    // Column (X): 0 → 479
+    ili9488_send_cmd(0x2A);
+    ili9488_send_data(0);
+    ili9488_send_data(0);
+    ili9488_send_data((480-1) >> 8);
+    ili9488_send_data((480-1) & 0xFF);
+
+    // Row (Y): 0 → 319
+    ili9488_send_cmd(0x2B);
+    ili9488_send_data(0);
+    ili9488_send_data(0);
+    ili9488_send_data((320-1) >> 8);
+    ili9488_send_data((320-1) & 0xFF);
+
+    // Memory write
+    ili9488_send_cmd(0x2C);
+    gpio_set_level(PIN_TFT_DC, 1);
+
+    spi_transaction_t t = {0};
+    t.tx_buffer = buf;
+
+    int sent = 0;
+    while (sent < total_pixels)
+    {
+        int to_send = (total_pixels - sent > chunk_pixels)
+                        ? chunk_pixels
+                        : (total_pixels - sent);
+
+        t.length = to_send * 24; // 24 bits = 3 bytes/pixel
+
+        spi_device_polling_transmit(tft_spi, &t);
+        sent += to_send;
+
+        vTaskDelay(pdMS_TO_TICKS(1)); // feed watchdog
+    }
+
+    heap_caps_free(buf);
+}
+
 
 /* ---------- WiFi ---------- */
 static void event_handler(void* arg, esp_event_base_t event_base,
@@ -149,6 +353,79 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     }
     return ESP_OK;
 }
+
+// Helper function to extract value after key
+static const char* find_value(const char* key, const char* json_str) {
+    char search[32];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char* pos = strstr(json_str, search);
+    if (!pos) return NULL;
+
+    pos += strlen(search);
+    // Skip whitespace
+    while (*pos == ' ' || *pos == '\t' || *pos == '\n') pos++;
+
+    return pos;
+}
+
+void display_entry_data_from_y(const char *json, int start_y)
+{
+    int y = start_y;
+    char line[64];
+
+    // Extract and display key fields
+    #define EXTRACT_STRING(name, label) { \
+        const char* val = find_value(name, json); \
+        if (val && *val == '"') { \
+            val++; \
+            const char* end = strchr(val, '"'); \
+            if (end) { \
+                int len = end - val; \
+                if (len > 0 && len < 30) { \
+                    char value[31]; \
+                    memcpy(value, val, len); \
+                    value[len] = '\0'; \
+                    snprintf(line, sizeof(line), "%s: %s", label, value); \
+                    drawText(10, y, line, 0xFFFF, 2); \
+                    y += 25; \
+                } \
+            } \
+        } \
+    }
+
+    #define EXTRACT_NUMBER(name, label) { \
+        const char* val = find_value(name, json); \
+        if (val) { \
+            char num_str[16]; \
+            int i = 0; \
+            while (*val && *val != ',' && *val != '}' && i < 15) { \
+                num_str[i++] = *val++; \
+            } \
+            num_str[i] = '\0'; \
+            if (i > 0) { \
+                float num = atof(num_str); \
+                if (strstr(name, "weight")) { \
+                    snprintf(line, sizeof(line), "%s: %.1fg", label, num); \
+                } else if (strstr(name, "kcal")) { \
+                    snprintf(line, sizeof(line), "%s: %.0f kcal", label, num); \
+                } else { \
+                    snprintf(line, sizeof(line), "%s: %.1fg", label, num); \
+                } \
+                drawText(10, y, line, 0xFFFF, 2); \
+                y += 25; \
+            } \
+        } \
+    }
+
+    // Extract fields
+    EXTRACT_STRING("label", "Food");
+    EXTRACT_NUMBER("weight_g", "Weight");
+    EXTRACT_NUMBER("estimated_kcal", "Calories");
+    EXTRACT_NUMBER("protein_g", "Protein");
+    EXTRACT_NUMBER("carbs_g", "Carbs");
+    EXTRACT_NUMBER("fat_g", "Fat");
+}
+
 
 static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
 {
@@ -315,12 +592,48 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
     
         ESP_LOGI(TAG, "Upload finished. HTTP status = %d, content_length = %d",
                  status, content_length);
-        
-        // Log the response captured by event handler
+    
         ESP_LOGI(TAG, "FastAPI Response (%d bytes): %s", response.len, response.buffer);
+    
+        // Prepare TFT screen
+        fill_color(0x0000); // Black background
+
+        char status_msg[32];
+        snprintf(status_msg, sizeof(status_msg), "HTTP Status: %d", status);
+
+        if (status == 200 || status == 201) {
+            drawText(10, 10, "SUCCESS!", 0x07E0, 3);
+            drawText(10, 50, status_msg, 0x07E0, 2);
+
+            // Parse and display entry data (starting from y=80)
+            display_entry_data_from_y(response.buffer, 80);
+        } else {
+            // ---- ERROR CASE ----
+            drawText(10, 10, "ERROR!", 0xF800, 3);
+            drawText(10, 50, status_msg, 0xF800, 2);
+
+            drawText(10, 80, "SERVER RESPONSE:", 0xFFFF, 2);
+
+            char safe_resp[61];
+            int copy_len = (response.len > 60) ? 60 : response.len;
+            memcpy(safe_resp, response.buffer, copy_len);
+            safe_resp[copy_len] = '\0';
+
+            drawText(10, 110, safe_resp, 0xF800, 2);
+        }
+    
     } else {
+        // ---- NETWORK ERROR ----
         ESP_LOGE(TAG, "HTTP POST failed: %d", err);
+    
+        fill_color(0x0000);
+        drawText(10, 10, "UPLOAD FAILED!", 0xF800, 3);
+
+        char error_msg[32];
+        snprintf(error_msg, sizeof(error_msg), "Network Error: %d", err);
+        drawText(10, 50, error_msg, 0xF800, 2);
     }
+    
 
     esp_http_client_cleanup(client);
     heap_caps_free(response.buffer);
@@ -515,23 +828,67 @@ void app_main(void)
     uartBegin(115200);
     ESP_LOGI(TAG, "ESP32 Camera Server starting...");
 
+    // Initialize display
+    ESP_LOGI(TAG, "Initializing display...");
+    gpio_config_t io = {0};
+    io.mode = GPIO_MODE_OUTPUT;
+    io.pin_bit_mask = (1ULL<<PIN_TFT_DC) | (1ULL<<PIN_TFT_RST);
+    gpio_config(&io);
+
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = PIN_TFT_MOSI,
+        .miso_io_num = -1,
+        .sclk_io_num = PIN_TFT_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 320*480*3
+    };
+    spi_bus_initialize(HSPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 20 * 1000 * 1000,
+        .mode = 0,
+        .spics_io_num = PIN_TFT_CS,
+        .queue_size = 1
+    };
+    spi_bus_add_device(HSPI_HOST, &devcfg, &tft_spi);
+
+    ili9488_init();
+
+    // Show initial message
+    fill_color(0x0000); // Black background
+    drawText(10, 10, "Initializing...", 0xFFFF, 3);
+    drawText(10, 50, "Please wait...", 0xFFFF, 2);
+
     ESP_LOGI(TAG, "Initializing WiFi...");
     wifi_init_sta();
+
+    fill_color(0x0000); // Black background
+    drawText(10, 10, "WiFi Connected!", 0x07E0, 3);
+    drawText(10, 50, "Initializing camera...", 0x07E0, 2);
 
     ESP_LOGI(TAG, "Initializing camera...");
     myCAM = createArducamCamera(CS_PIN);
     begin(&myCAM);
 
+    fill_color(0x0000); // Black background
+    drawText(10, 10, "Camera Ready!", 0x07E0, 3);
+    drawText(10, 50, "Starting web server...", 0x07E0, 2);
+
     ESP_LOGI(TAG, "Starting web server...");
     server = start_webserver();
     if (server) {
         ESP_LOGI(TAG, "Camera server started successfully!");
-        ESP_LOGI(TAG, "Visit http://<ESP32_IP>/");
-        ESP_LOGI(TAG, "Visit http://<ESP32_IP>/capture to capture an image");
+        fill_color(0x0000); // Black background
+        drawText(10, 10, "Ready!", 0x07E0, 4);
+        drawText(10, 60, "Visit http://<ESP32_IP>/capture", 0x07E0, 2);
     } else {
         ESP_LOGE(TAG, "Failed to start web server!");
+        fill_color(0x0000); // Black background
+        drawText(10, 10, "Web server failed!", 0xF800, 3);
     }
 
+    // Keep camera alive
     while (1) {
         captureThread(&myCAM);
         vTaskDelay(pdMS_TO_TICKS(20));
