@@ -7,6 +7,8 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -31,6 +33,10 @@
 #define PIN_TFT_DC     13
 #define PIN_TFT_RST     4
 
+// ---- HX711 Load Cell pins ----
+#define HX_DOUT 34
+#define HX_SCK  14
+
 // ---- WiFi config (change to your AP) ----
 #define WIFI_SSID "Testpress_4G"
 #define WIFI_PASS "Tp@12345"
@@ -47,6 +53,10 @@ static httpd_handle_t server = NULL;
 
 // ---- Display globals ----
 spi_device_handle_t tft_spi = NULL;
+
+// ---- HX711 globals ----
+static long hx711_offset = 0;           // raw zero point (set by tare)
+static double hx711_scale = -0.001307;   // g per count (update via calibration)
 
 // WiFi event group
 static EventGroupHandle_t s_wifi_event_group;
@@ -243,6 +253,67 @@ void fill_color(uint16_t color565)
     heap_caps_free(buf);
 }
 
+// ---- HX711 Load Cell functions ----
+static void hx711_init(void) {
+    gpio_reset_pin(HX_DOUT);
+    gpio_set_direction(HX_DOUT, GPIO_MODE_INPUT);
+    gpio_reset_pin(HX_SCK);
+    gpio_set_direction(HX_SCK, GPIO_MODE_OUTPUT);
+    gpio_set_level(HX_SCK, 0);
+}
+
+static bool hx711_wait_ready(int timeout_ms) {
+    int64_t start = esp_timer_get_time();
+    while (gpio_get_level(HX_DOUT) == 1) {
+        vTaskDelay(10 / portTICK_PERIOD_MS);  // longer delay to prevent watchdog
+        if ((esp_timer_get_time() - start) > timeout_ms * 1000) {
+            ESP_LOGW(TAG, "HX711 not ready after %d ms", timeout_ms);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int32_t hx711_read_raw(void) {
+    if (!hx711_wait_ready(500)) return 0;
+
+    uint32_t value = 0;
+    for (int i = 0; i < 24; i++) {
+        gpio_set_level(HX_SCK, 1);
+        esp_rom_delay_us(1);
+        value = (value << 1) | gpio_get_level(HX_DOUT);
+        gpio_set_level(HX_SCK, 0);
+        esp_rom_delay_us(1);
+    }
+
+    gpio_set_level(HX_SCK, 1); esp_rom_delay_us(1);
+    gpio_set_level(HX_SCK, 0); esp_rom_delay_us(1);
+
+    if (value & 0x800000) value |= 0xFF000000;  // sign extend
+    return (int32_t)value;
+}
+
+static long hx711_read_raw_average(uint16_t samples) {
+    long sum = 0;
+    for (uint16_t i = 0; i < samples; ++i) {
+        sum += hx711_read_raw();
+    }
+    return sum / (long)samples;
+}
+
+static double hx711_grams_from_raw(long raw) {
+    return (raw - hx711_offset) * hx711_scale;
+}
+
+static void hx711_do_tare(uint16_t samples) {
+    hx711_offset = hx711_read_raw_average(samples);
+    ESP_LOGI(TAG, "[HX711 TARE] OFFSET set to %ld (avg of %u samples)", hx711_offset, samples);
+}
+
+static double hx711_get_weight_grams(void) {
+    long raw = hx711_read_raw_average(10);  // balanced averaging for stability and speed
+    return hx711_grams_from_raw(raw);
+}
 
 /* ---------- WiFi ---------- */
 static void event_handler(void* arg, esp_event_base_t event_base,
@@ -427,13 +498,14 @@ void display_entry_data_from_y(const char *json, int start_y)
 }
 
 
-static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len)
+static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, double weight_grams)
 {
     const char *url = UPLOAD_URL;
     const char *auth_header_value = AUTH_HEADER_VALUE;
 
     const char *timestamp_value = "2024-01-15T12:30:00Z";
-    const char *weight_value = "10";
+    char weight_value[16];
+    snprintf(weight_value, sizeof(weight_value), "%.2f", weight_grams);
     const char *user_id_value = "11";
     const char *file_field_name = "image_file";
     const char *file_name = "capture.jpg";
@@ -664,6 +736,10 @@ static esp_err_t capture_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Capture request received");
 
+    // Read current weight from load cell
+    double current_weight = hx711_get_weight_grams();
+    ESP_LOGI(TAG, "Current weight: %.2f grams", current_weight);
+
     CamStatus status = takePicture(&myCAM, CAM_IMAGE_MODE_VGA, CAM_IMAGE_PIX_FMT_JPG);
     if (status != CAM_ERR_SUCCESS) {
         ESP_LOGE(TAG, "Failed to take picture, status: %d", status);
@@ -753,7 +829,7 @@ static esp_err_t capture_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    esp_err_t post_err = send_image_to_server(image_data, image_length);
+    esp_err_t post_err = send_image_to_server(image_data, image_length, current_weight);
     if (post_err != ESP_OK) {
         ESP_LOGW(TAG, "send_image_to_server failed: %d", post_err);
     } else {
@@ -854,6 +930,11 @@ void app_main(void)
     spi_bus_add_device(HSPI_HOST, &devcfg, &tft_spi);
 
     ili9488_init();
+
+    ESP_LOGI(TAG, "Initializing HX711 load cell...");
+    hx711_init();
+    // Initial tare with balanced samples for stability and speed
+    hx711_do_tare(20);
 
     // Show initial message
     fill_color(0x0000); // Black background
