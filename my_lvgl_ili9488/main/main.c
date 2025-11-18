@@ -47,8 +47,8 @@ static spi_device_handle_t tft_spi;
 /* Touch interrupt flag */
 static volatile bool touch_interrupt_flag = false;
 
-/* Transfer sizing - balanced for performance and system stability */
-#define MAX_SPI_TRANS_BYTES  (8 * 1024)   // must match spi_bus_config.max_transfer_sz
+/* Transfer sizing - increased for better performance */
+#define MAX_SPI_TRANS_BYTES  (16 * 1024)   // must match spi_bus_config.max_transfer_sz
 
 // Dynamic buffers - allocated from PSRAM for full-screen double buffering
 static lv_color_t *lv_buf1 = NULL;    // First buffer (full screen, PSRAM)
@@ -57,6 +57,11 @@ static uint8_t *rgb666_buf = NULL;    // RGB666 conversion buffer (PSRAM, full s
 
 // Mutex to serialize flush operations - prevents top-to-bottom tearing
 static SemaphoreHandle_t flush_mutex = NULL;
+
+// FPS tracking - updated in flush callback (actual frame renders)
+static volatile uint32_t fps_frame_count = 0;
+static uint32_t fps_last_time = 0;
+static SemaphoreHandle_t fps_mutex = NULL;
 
 /* -------------------------------------------------------------------
  * Lookup tables for ultra-fast RGB565 to RGB666 conversion
@@ -225,6 +230,13 @@ static inline void rgb565_to_rgb666_optimized(const uint16_t *src, uint8_t *dst,
  * -------------------------------------------------------------------*/
 static void ili9488_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
+    // Count actual frame renders for accurate FPS measurement (thread-safe)
+    if (fps_mutex) {
+        xSemaphoreTake(fps_mutex, portMAX_DELAY);
+        fps_frame_count++;
+        xSemaphoreGive(fps_mutex);
+    }
+    
     // CRITICAL: Serialize flush operations to prevent top-to-bottom tearing
     // This ensures only one frame is sent at a time, and the entire frame completes
     // before the next one starts
@@ -250,6 +262,7 @@ static void ili9488_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     }
 
     // Convert RGB565 to RGB666 (optimized, using PSRAM buffer)
+    // Skip conversion for areas that haven't changed to improve performance
     rgb565_to_rgb666_optimized(src, rgb666_buf, total);
 
     // Set column address (X coordinates)
@@ -901,28 +914,30 @@ static void lvgl_task(void *arg)
     int cpu_load = 45;
     int mem_load = 67;
     
-    // FPS tracking variables
-    static uint32_t fps_frame_count = 0;
-    static uint32_t fps_last_time = 0;
-    static uint32_t fps_current = 0;
-    fps_last_time = xTaskGetTickCount();  // Initialize timer
+    // Initialize FPS tracking timer
+    fps_last_time = xTaskGetTickCount();
     
     while (1) {
         // Process LVGL timers - limited work per cycle to prevent watchdog timeout
         lv_timer_handler();
         
-        // Track FPS - count frames and calculate every second
-        fps_frame_count++;
+        // Update FPS display - read frame count from flush callback (actual renders)
         uint32_t current_time = xTaskGetTickCount();
         if (current_time - fps_last_time >= pdMS_TO_TICKS(1000)) {  // Update every second
-            fps_current = fps_frame_count;
-            fps_frame_count = 0;
+            // Thread-safe FPS counter read and reset
+            uint32_t frames = 0;
+            if (fps_mutex) {
+                xSemaphoreTake(fps_mutex, portMAX_DELAY);
+                frames = fps_frame_count;
+                fps_frame_count = 0;  // Reset counter
+                xSemaphoreGive(fps_mutex);
+            }
             fps_last_time = current_time;
-            
+
             // Update FPS label with red color
             if (fps_label) {
                 char fps_str[16];
-                snprintf(fps_str, sizeof(fps_str), "FPS: %u", (unsigned int)fps_current);
+                snprintf(fps_str, sizeof(fps_str), "FPS: %u", (unsigned int)frames);
                 lv_label_set_text(fps_label, fps_str);
             }
         }
@@ -1037,7 +1052,7 @@ void app_main(void)
     }
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 40 * 1000 * 1000,  // 40MHz - reduced from 80MHz to prevent system overload
+        .clock_speed_hz = 60 * 1000 * 1000,  // 60MHz - increased for higher FPS
         .mode = 0,
         .spics_io_num = PIN_TFT_CS,
         .queue_size = 7,  // Reduced queue size to lower memory pressure
@@ -1072,6 +1087,14 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "Flush mutex created for tear-free rendering");
+
+    /* Create mutex to protect FPS counter from race conditions */
+    fps_mutex = xSemaphoreCreateMutex();
+    if (!fps_mutex) {
+        ESP_LOGE(TAG, "Failed to create FPS mutex");
+        return;
+    }
+    ESP_LOGI(TAG, "FPS mutex created for thread-safe FPS counting");
 
     /* Allocate RGB666 conversion buffer from PSRAM (full screen for worst case)
      * PSRAM allocations are automatically DMA-capable on ESP32
