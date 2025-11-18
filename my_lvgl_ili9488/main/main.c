@@ -60,17 +60,18 @@ static uint8_t *rgb666_buf = NULL;
 /* -------------------------------------------------------------------
  * Low-level SPI helpers (with chunking)
  * -------------------------------------------------------------------*/
-static void send_cmd(uint8_t cmd)
-{
-    gpio_set_level(PIN_TFT_DC, 0);
-    spi_transaction_t t = {0};
-    t.length = 8;
-    t.tx_buffer = &cmd;
-    esp_err_t err = spi_device_polling_transmit(tft_spi, &t);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "send_cmd spi tx err %s", esp_err_to_name(err));
-    }
-}
+ static void send_cmd(uint8_t cmd)
+ {
+     gpio_set_level(PIN_TFT_DC, 0);
+     spi_transaction_t t = {0};
+     t.length = 8; // bits
+     t.flags = SPI_TRANS_USE_TXDATA;
+     t.tx_data[0] = cmd;
+     esp_err_t err = spi_device_polling_transmit(tft_spi, &t);
+     if (err != ESP_OK) {
+         ESP_LOGW(TAG, "send_cmd spi tx err %s", esp_err_to_name(err));
+     }
+ } 
 
 static void send_data_chunked(const uint8_t *data, size_t len)
 {
@@ -129,28 +130,29 @@ static void ili9488_init(void)
  * -------------------------------------------------------------------*/
 static void ili9488_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    int w = area->x2 - area->x1 + 1;
-    int h = area->y2 - area->y1 + 1;
+    // Use the pixel data directly (LVGL v9 handles palette metadata internally)
+    uint16_t *src = (uint16_t *)px_map;
+
+    int32_t w = lv_area_get_width(area);
+    int32_t h = lv_area_get_height(area);
     int total = w * h;
-    if (total <= 0) {
-        lv_display_flush_ready(disp);
-        return;
-    }
+
+    // Safety check
     if (!rgb666_buf) {
         ESP_LOGE(TAG, "rgb666_buf NULL in flush");
         lv_display_flush_ready(disp);
         return;
     }
 
-    uint16_t *src = (uint16_t *)px_map;
+    // Convert RGB565 to RGB666 with proper scaling (original working algorithm)
     for (int i = 0; i < total; ++i) {
         uint16_t c = src[i];
         uint8_t r5 = (c >> 11) & 0x1F;
         uint8_t g6 = (c >> 5)  & 0x3F;
         uint8_t b5 = (c)       & 0x1F;
-        rgb666_buf[3*i + 0] = (uint8_t)(r5 << 3);
-        rgb666_buf[3*i + 1] = (uint8_t)(g6 << 2);
-        rgb666_buf[3*i + 2] = (uint8_t)(b5 << 3);
+        rgb666_buf[3*i + 0] = (uint8_t)(r5 << 3);  // 5-bit -> 8-bit (multiply by 8)
+        rgb666_buf[3*i + 1] = (uint8_t)(g6 << 2);  // 6-bit -> 8-bit (multiply by 4)
+        rgb666_buf[3*i + 2] = (uint8_t)(b5 << 3);  // 5-bit -> 8-bit (multiply by 8)
     }
 
     uint8_t col[4] = {
@@ -923,21 +925,36 @@ void app_main(void)
     ESP_LOGI(TAG, "Allocated rgb666_buf %u bytes", (unsigned)RGB666_BUF_SIZE);
     
     /* Allocate LVGL buffers dynamically for double buffering */
-    size_t lvgl_buf_size = BUF_PIXELS * sizeof(lv_color_t);
-    lv_buf1 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_DMA);
-    if (!lv_buf1) {
-        ESP_LOGE(TAG, "Failed to alloc lv_buf1 (%u bytes)", (unsigned)lvgl_buf_size);
+    // number of pixels in one buffer (e.g., WIDTH * 38)
+    #define LV_BUF_PIXELS (HOR_RES * LINES)
+
+    // size in bytes
+    size_t lvgl_buf_size_bytes = LV_BUF_PIXELS * sizeof(lv_color_t);
+
+    // allocate DMA-capable memory +8 bytes for LVGL palette reserve
+    lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes + 8, MALLOC_CAP_DMA);
+    lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes + 8, MALLOC_CAP_DMA);
+
+    if (!lv_buf1 || !lv_buf2) {
+        ESP_LOGE(TAG, "Failed to allocate LVGL buffers");
+        if (lv_buf1) free(lv_buf1);
+        if (lv_buf2) free(lv_buf2);
         return;
     }
-    
-    lv_buf2 = heap_caps_malloc(lvgl_buf_size, MALLOC_CAP_DMA);
-    if (!lv_buf2) {
-        ESP_LOGE(TAG, "Failed to alloc lv_buf2 (%u bytes)", (unsigned)lvgl_buf_size);
-        free(lv_buf1);
-        return;
-    }
-    ESP_LOGI(TAG, "Allocated LVGL double buffers: 2 × %u bytes = %u bytes total", 
-             (unsigned)lvgl_buf_size, (unsigned)(lvgl_buf_size * 2));
+    ESP_LOGI(TAG, "Allocated LVGL double buffers: 2 × %u bytes (+8 each) = %u bytes total",
+             (unsigned)lvgl_buf_size_bytes, (unsigned)(lvgl_buf_size_bytes * 2 + 16));
+
+    /* Initialize LVGL draw buffers */
+    /* Initialize LVGL draw buffers (skip first 8 bytes reserved by LVGL) */
+    static lv_draw_buf_t draw_buf1, draw_buf2;
+
+    /* LVGL reserves 8 bytes at start of each buffer for palette/metadata.
+    We allocated +8 bytes above, so pass buffer pointer +8 bytes here. */
+    lv_color_t *lv_buf1_aligned = (lv_color_t *)(((uint8_t *)lv_buf1) + 8);
+    lv_color_t *lv_buf2_aligned = (lv_color_t *)(((uint8_t *)lv_buf2) + 8);
+
+    lv_draw_buf_init(&draw_buf1, HOR_RES, LINES, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO, lv_buf1_aligned, lvgl_buf_size_bytes);
+    lv_draw_buf_init(&draw_buf2, HOR_RES, LINES, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO, lv_buf2_aligned, lvgl_buf_size_bytes);
 
     /* Create LVGL display (v9) */
     lv_display_t *disp = lv_display_create(HOR_RES, VER_RES);
@@ -948,7 +965,7 @@ void app_main(void)
 
     lv_display_set_flush_cb(disp, ili9488_flush);
     // Double buffering: use both buffers for tear-free rendering
-    lv_display_set_buffers(disp, lv_buf1, lv_buf2, lvgl_buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_draw_buffers(disp, &draw_buf1, &draw_buf2);
     
     /* Register touch input device with LVGL */
     lv_indev_t *indev = lv_indev_create();
