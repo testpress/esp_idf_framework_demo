@@ -840,7 +840,7 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, doub
     // Allocate response buffer
     response_buffer_t response;
     response.max_len = 4096;
-    response.buffer = heap_caps_malloc(response.max_len, MALLOC_CAP_8BIT);
+    response.buffer = heap_caps_malloc(response.max_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     response.len = 0;
     
     if (!response.buffer) {
@@ -1604,9 +1604,9 @@ void app_main(void)
 
     /* Allocate RGB666 conversion buffer from PSRAM */
     size_t rgb666_buf_size = HOR_RES * VER_RES * 3;
-    rgb666_buf = heap_caps_malloc(rgb666_buf_size, MALLOC_CAP_SPIRAM);
+    rgb666_buf = heap_caps_malloc(rgb666_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!rgb666_buf) {
-        rgb666_buf = heap_caps_malloc(rgb666_buf_size, MALLOC_CAP_DEFAULT);
+        rgb666_buf = heap_caps_malloc(rgb666_buf_size, MALLOC_CAP_DEFAULT | MALLOC_CAP_8BIT);
         if (!rgb666_buf) {
             ESP_LOGE(TAG, "Failed to allocate rgb666_buf");
             return;
@@ -1616,15 +1616,15 @@ void app_main(void)
 
     /* Allocate LVGL full-screen buffers from PSRAM */
     size_t lvgl_buf_size_bytes = HOR_RES * VER_RES * sizeof(lv_color_t);
-    lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_SPIRAM);
-    lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_SPIRAM);
+    lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     if (!lv_buf1 || !lv_buf2) {
         ESP_LOGW(TAG, "PSRAM allocation failed, trying regular heap");
         if (lv_buf1) free(lv_buf1);
         if (lv_buf2) free(lv_buf2);
-        lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_DEFAULT);
-        lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_DEFAULT);
+        lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_DEFAULT | MALLOC_CAP_8BIT);
+        lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_DEFAULT | MALLOC_CAP_8BIT);
         if (!lv_buf1 || !lv_buf2) {
             ESP_LOGE(TAG, "Failed to allocate LVGL buffers!");
             return;
