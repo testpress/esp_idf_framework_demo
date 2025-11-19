@@ -904,13 +904,13 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, doub
             // Update results display with parsed data
             update_results_display();
 
-            // Hide loading screen
-            hide_loading_screen();
-
-            // Switch to results tab
+            // Switch to results tab FIRST (before hiding loading screen)
             if (tabview) {
-                lv_tabview_set_active(tabview, 1, LV_ANIM_ON);
+                lv_tabview_set_active(tabview, 1, LV_ANIM_OFF); // Instant switch, no animation
             }
+
+            // Hide loading screen to reveal results
+            hide_loading_screen();
 
             update_ui_status("Meal analyzed successfully!");
         } else {
@@ -1295,23 +1295,24 @@ static void show_loading_screen(void)
     if (!loading_screen) {
         lv_obj_t *scr = lv_screen_active();
 
-        // Create loading overlay
+        // Create simple loading overlay
         loading_screen = lv_obj_create(scr);
         lv_obj_set_size(loading_screen, HOR_RES, VER_RES);
         lv_obj_align(loading_screen, LV_ALIGN_TOP_LEFT, 0, 0);
         lv_obj_set_style_bg_color(loading_screen, lv_color_hex(0x0A0E27), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(loading_screen, LV_OPA_90, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(loading_screen, LV_OPA_80, LV_PART_MAIN);
         lv_obj_clear_flag(loading_screen, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(loading_screen, LV_OBJ_FLAG_CLICKABLE); // Block interactions
 
-        // Loading text
+        // Simple loading text
         lv_obj_t *loading_text = lv_label_create(loading_screen);
-        lv_label_set_text(loading_text, "Analyzing Meal...");
+        lv_label_set_text(loading_text, "Analyzing...");
         lv_obj_set_style_text_color(loading_text, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_align(loading_text, LV_ALIGN_TOP_MID, 0, 120);
+        lv_obj_align(loading_text, LV_ALIGN_CENTER, 0, -20);
 
-        // Spinner
+        // Simple spinner
         spinner = lv_spinner_create(loading_screen);
-        lv_obj_set_size(spinner, 60, 60);
+        lv_obj_set_size(spinner, 40, 40);
         lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 20);
         lv_obj_set_style_arc_color(spinner, lv_color_hex(0x2196F3), LV_PART_INDICATOR);
     }
