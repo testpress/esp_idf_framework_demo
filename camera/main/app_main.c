@@ -14,6 +14,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "driver/i2c.h"
 #include "uart.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,20 @@
 #define PIN_TFT_CS      5
 #define PIN_TFT_DC     13
 #define PIN_TFT_RST     4
+
+// ---- Touch pins (FT6206 - I2C) ----
+#define I2C_MASTER_NUM              I2C_NUM_0
+#define I2C_MASTER_SDA_IO           21
+#define I2C_MASTER_SCL_IO           22
+#define I2C_MASTER_FREQ_HZ          400000
+#define I2C_MASTER_TX_BUF_DISABLE   0
+#define I2C_MASTER_RX_BUF_DISABLE   0
+#define I2C_MASTER_TIMEOUT_MS       1000
+
+#define PIN_TOUCH_IRQ  27
+#define PIN_TOUCH_RST  32
+#define FT6206_I2C_ADDR    0x38
+#define TOUCH_THRESHOLD    40
 
 // ---- HX711 Load Cell pins ----
 #define HX_DOUT 34
@@ -63,9 +78,34 @@ static lv_color_t *lv_buf1 = NULL;
 static lv_color_t *lv_buf2 = NULL;
 static uint8_t *rgb666_buf = NULL;
 
+// ---- Touch globals ----
+static volatile bool touch_interrupt_flag = false;
+
 // ---- UI Status globals ----
 static char ui_status_message[128] = "Initializing...";
 static bool ui_status_update = false;
+
+// ---- UI Navigation globals ----
+static lv_obj_t *tabview = NULL;
+static lv_obj_t *tab_capture = NULL;
+static lv_obj_t *tab_results = NULL;
+
+// ---- Meal data globals ----
+static char meal_label[256] = "";
+static float meal_weight = 0.0f;
+static float meal_calories = 0.0f;
+static float meal_protein = 0.0f;
+static float meal_carbs = 0.0f;
+static float meal_fat = 0.0f;
+static char meal_status[32] = "";
+
+// ---- Results page UI elements ----
+static lv_obj_t *result_meal_name = NULL;
+static lv_obj_t *result_weight = NULL;
+static lv_obj_t *result_calories = NULL;
+static lv_obj_t *result_protein = NULL;
+static lv_obj_t *result_carbs = NULL;
+static lv_obj_t *result_fat = NULL;
 
 // ---- UI Status functions ----
 static void update_ui_status(const char *message)
@@ -73,6 +113,73 @@ static void update_ui_status(const char *message)
     strncpy(ui_status_message, message, sizeof(ui_status_message) - 1);
     ui_status_message[sizeof(ui_status_message) - 1] = '\0';
     ui_status_update = true;
+}
+
+// ---- Function prototypes ----
+static void update_results_display(void);
+
+// ---- JSON Parsing functions ----
+static const char* find_json_value(const char* json_str, const char* key) {
+    char search_key[64];
+    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
+    const char* pos = strstr(json_str, search_key);
+    if (!pos) return NULL;
+
+    pos += strlen(search_key);
+    // Skip whitespace
+    while (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r') pos++;
+
+    return pos;
+}
+
+static void parse_meal_response(const char* json_response) {
+    // Parse status
+    const char* status_pos = find_json_value(json_response, "status");
+    if (status_pos && *status_pos == '"') {
+        status_pos++;
+        const char* end = strchr(status_pos, '"');
+        if (end) {
+            size_t len = end - status_pos;
+            if (len < sizeof(meal_status)) {
+                memcpy(meal_status, status_pos, len);
+                meal_status[len] = '\0';
+            }
+        }
+    }
+
+    // Parse entry object
+    const char* entry_pos = find_json_value(json_response, "entry");
+    if (entry_pos && *entry_pos == '{') {
+        // Parse label
+        const char* label_pos = find_json_value(entry_pos, "label");
+        if (label_pos && *label_pos == '"') {
+            label_pos++;
+            const char* end = strchr(label_pos, '"');
+            if (end) {
+                size_t len = end - label_pos;
+                if (len < sizeof(meal_label)) {
+                    memcpy(meal_label, label_pos, len);
+                    meal_label[len] = '\0';
+                }
+            }
+        }
+
+        // Parse numeric values
+        const char* weight_pos = find_json_value(entry_pos, "weight_g");
+        if (weight_pos) meal_weight = atof(weight_pos);
+
+        const char* kcal_pos = find_json_value(entry_pos, "estimated_kcal");
+        if (kcal_pos) meal_calories = atof(kcal_pos);
+
+        const char* protein_pos = find_json_value(entry_pos, "protein_g");
+        if (protein_pos) meal_protein = atof(protein_pos);
+
+        const char* carbs_pos = find_json_value(entry_pos, "carbs_g");
+        if (carbs_pos) meal_carbs = atof(carbs_pos);
+
+        const char* fat_pos = find_json_value(entry_pos, "fat_g");
+        if (fat_pos) meal_fat = atof(fat_pos);
+    }
 }
 
 // ---- HX711 globals ----
@@ -258,6 +365,190 @@ static void ili9488_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     lv_display_flush_ready(disp);
 }
 
+// ---- Touch functions ----
+
+/* -------------------------------------------------------------------
+ * I2C Master Initialization
+ * -------------------------------------------------------------------*/
+static esp_err_t i2c_master_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
+}
+
+/* -------------------------------------------------------------------
+ * Touch Controller (FT6206) - I2C Functions
+ * -------------------------------------------------------------------*/
+#define FT6206_REG_NUMTOUCHES   0x02  // Number of touch points
+#define FT6206_REG_THRESHHOLD   0x80  // Touch threshold register
+#define FT6206_REG_P1_XH        0x03  // Point 1 X position high byte
+#define FT6206_REG_P1_XL        0x04  // Point 1 X position low byte
+#define FT6206_REG_P1_YH        0x05  // Point 1 Y position high byte
+#define FT6206_REG_P1_YL        0x06  // Point 1 Y position low byte
+
+static void touch_reset(void)
+{
+    // Configure RST pin as output
+    gpio_config_t rst_config = {
+        .pin_bit_mask = (1ULL << PIN_TOUCH_RST),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&rst_config);
+
+    // Reset sequence: LOW → 10ms delay → HIGH → 50ms delay
+    gpio_set_level(PIN_TOUCH_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(PIN_TOUCH_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+static void IRAM_ATTR touch_isr_handler(void* arg)
+{
+    touch_interrupt_flag = true;
+}
+
+static void touch_interrupt_init(void)
+{
+    // Configure IRQ pin as input with pull-up
+    gpio_config_t irq_config = {
+        .pin_bit_mask = (1ULL << PIN_TOUCH_IRQ),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,  // FALLING edge
+    };
+    gpio_config(&irq_config);
+
+    // Install ISR handler
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PIN_TOUCH_IRQ, touch_isr_handler, NULL);
+}
+
+static esp_err_t ft6206_init(uint8_t threshold)
+{
+    uint8_t data[2];
+
+    // Set touch threshold
+    data[0] = FT6206_REG_THRESHHOLD;
+    data[1] = threshold;
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (FT6206_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(cmd, data, 2, true);
+    i2c_master_stop(cmd);
+
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+
+    return ret;
+}
+
+static esp_err_t ft6206_read_touch(uint16_t* x, uint16_t* y, uint8_t* num_touches)
+{
+    uint8_t data[16];
+
+    // Read touch data starting from register 0x00
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (FT6206_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (FT6206_I2C_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(cmd, data, 16, I2C_MASTER_LAST_NACK);
+    i2c_master_stop(cmd);
+
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Parse touch data
+    *num_touches = data[FT6206_REG_NUMTOUCHES] & 0x0F;
+
+    if (*num_touches > 0) {
+        // Point 1 coordinates
+        uint16_t raw_x = ((data[FT6206_REG_P1_XH] & 0x0F) << 8) | data[FT6206_REG_P1_XL];
+        uint16_t raw_y = ((data[FT6206_REG_P1_YH] & 0x0F) << 8) | data[FT6206_REG_P1_YL];
+
+        // Calibrated touch mapping for 480x320 display
+        // These values may need calibration for your specific touchscreen
+        #define TOUCH_X_MIN 10
+        #define TOUCH_X_MAX 320
+        #define TOUCH_Y_MIN 0
+        #define TOUCH_Y_MAX 470
+
+        // Map raw coordinates to screen coordinates
+        int32_t mapped_x = ((int32_t)(TOUCH_Y_MAX - raw_y) * (HOR_RES - 1)) / TOUCH_Y_MAX;
+        int32_t mapped_y = ((int32_t)(raw_x - TOUCH_X_MIN) * (VER_RES - 1)) / (TOUCH_X_MAX - TOUCH_X_MIN);
+
+        // Clamp to screen bounds
+        if (mapped_x < 0) mapped_x = 0;
+        if (mapped_x >= HOR_RES) mapped_x = HOR_RES - 1;
+        if (mapped_y < 0) mapped_y = 0;
+        if (mapped_y >= VER_RES) mapped_y = VER_RES - 1;
+
+        *x = (uint16_t)mapped_x;
+        *y = (uint16_t)mapped_y;
+
+        ESP_LOGI(TAG, "Touch: raw(%d,%d) → screen(%d,%d)", raw_x, raw_y, *x, *y);
+    }
+
+    return ESP_OK;
+}
+
+/* -------------------------------------------------------------------
+ * LVGL Touch Input Callback
+ * -------------------------------------------------------------------*/
+static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    static int16_t last_x = 0;
+    static int16_t last_y = 0;
+
+    // Check for touch interrupt flag
+    if (touch_interrupt_flag) {
+        touch_interrupt_flag = false;
+
+        // Read touch data
+        uint16_t x, y;
+        uint8_t num_touches;
+
+        if (ft6206_read_touch(&x, &y, &num_touches) == ESP_OK && num_touches > 0) {
+            // Clamp to screen bounds
+            if (x >= HOR_RES) x = HOR_RES - 1;
+            if (y >= VER_RES) y = VER_RES - 1;
+
+            last_x = x;
+            last_y = y;
+
+            data->point.x = x;
+            data->point.y = y;
+            data->state = LV_INDEV_STATE_PRESSED;
+        } else {
+            data->point.x = last_x;
+            data->point.y = last_y;
+            data->state = LV_INDEV_STATE_RELEASED;
+        }
+    } else {
+        data->point.x = last_x;
+        data->point.y = last_y;
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
 
 // ---- HX711 Load Cell functions ----
 static void hx711_init(void) {
@@ -603,8 +894,18 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, doub
         ESP_LOGI(TAG, "FastAPI Response (%d bytes): %s", response.len, response.buffer);
 
         if (status == 200 || status == 201) {
-            update_ui_status("Upload successful!");
-            // Parse and display entry data would go here in a more complete implementation
+            // Parse the JSON response and store meal data
+            parse_meal_response((const char*)response.buffer);
+
+            // Update results display with parsed data
+            update_results_display();
+
+            // Switch to results tab
+            if (tabview) {
+                lv_tabview_set_active(tabview, 1, LV_ANIM_ON);
+            }
+
+            update_ui_status("Meal analyzed successfully!");
         } else {
             // ---- ERROR CASE ----
             char status_msg[64];
@@ -840,12 +1141,170 @@ static lv_obj_t *status_label = NULL;
 static lv_obj_t *weight_label = NULL;
 static lv_obj_t *capture_btn = NULL;
 
+static void trigger_capture(void)
+{
+    ESP_LOGI(TAG, "Capture triggered");
+
+    // Read current weight from load cell
+    double current_weight = hx711_get_weight_grams();
+    ESP_LOGI(TAG, "Current weight: %.2f grams", current_weight);
+
+    CamStatus status = takePicture(&myCAM, CAM_IMAGE_MODE_VGA, CAM_IMAGE_PIX_FMT_JPG);
+    if (status != CAM_ERR_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to take picture, status: %d", status);
+        update_ui_status("Camera capture failed");
+        return;
+    }
+
+    const TickType_t wait_tick = pdMS_TO_TICKS(50);
+    const int max_wait_cycles = 40;
+    int wait_count = 0;
+    uint32_t image_length = 0;
+
+    ESP_LOGI(TAG, "Waiting for image to be ready...");
+    while (wait_count < max_wait_cycles) {
+        captureThread(&myCAM);
+        vTaskDelay(wait_tick);
+        image_length = imageAvailable(&myCAM);
+        if (image_length > 0) break;
+        wait_count++;
+    }
+
+    if (image_length == 0) {
+        ESP_LOGE(TAG, "Timeout waiting for image (no data available)");
+        update_ui_status("Camera timeout");
+        return;
+    }
+
+    if (image_length > 2000000) {
+        ESP_LOGE(TAG, "Image too large: %u", (unsigned)image_length);
+        update_ui_status("Image too large");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Image length: %u bytes", (unsigned)image_length);
+
+    uint8_t *image_data = heap_caps_malloc(image_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!image_data) {
+        ESP_LOGE(TAG, "Failed to allocate PSRAM for image!");
+        update_ui_status("Memory allocation failed");
+        return;
+    }
+
+    const uint32_t chunk_size = 200;
+    uint8_t *tmp_buf = heap_caps_malloc(chunk_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tmp_buf) {
+        ESP_LOGE(TAG, "Failed to allocate tmp buffer!");
+        heap_caps_free(image_data);
+        update_ui_status("Memory allocation failed");
+        return;
+    }
+
+    uint32_t bytes_read = 0;
+    while (bytes_read < image_length) {
+        uint32_t remaining = image_length - bytes_read;
+        uint32_t to_read = (remaining > chunk_size) ? chunk_size : remaining;
+
+        uint8_t got = 0;
+        int retry = 0;
+        const int max_read_retries = 5;
+        while (retry < max_read_retries) {
+            captureThread(&myCAM);
+            got = readBuff(&myCAM, tmp_buf, (uint8_t)to_read);
+            if (got > 0) break;
+            vTaskDelay(pdMS_TO_TICKS(10 + retry*5));
+            retry++;
+        }
+
+        if (got == 0) {
+            ESP_LOGE(TAG, "Failed to read chunk after retries (read %u/%u bytes)",
+                     (unsigned)bytes_read, (unsigned)image_length);
+            heap_caps_free(tmp_buf);
+            heap_caps_free(image_data);
+            update_ui_status("Camera read failed");
+            return;
+        }
+
+        memcpy(image_data + bytes_read, tmp_buf, got);
+        bytes_read += got;
+    }
+
+    heap_caps_free(tmp_buf);
+
+    if (bytes_read != image_length) {
+        ESP_LOGE(TAG, "Incomplete read: %u/%u", (unsigned)bytes_read, (unsigned)image_length);
+        heap_caps_free(image_data);
+        update_ui_status("Incomplete image read");
+        return;
+    }
+
+    esp_err_t post_err = send_image_to_server(image_data, image_length, current_weight);
+    if (post_err != ESP_OK) {
+        ESP_LOGW(TAG, "send_image_to_server failed: %d", post_err);
+    } else {
+        ESP_LOGI(TAG, "Image uploaded to backend successfully");
+        update_ui_status("Upload successful!");
+    }
+
+    heap_caps_free(image_data);
+}
+
 static void capture_btn_handler(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED) {
-        ESP_LOGI(TAG, "Capture button pressed");
-        // Capture will be handled by web server endpoint
+        ESP_LOGI(TAG, "Capture button pressed - triggering capture");
+        // Trigger the same capture functionality as the web endpoint
+        trigger_capture();
+    }
+}
+
+static void back_to_capture_handler(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        ESP_LOGI(TAG, "Back to capture button pressed");
+        // Switch back to capture tab
+        if (tabview) {
+            lv_tabview_set_active(tabview, 0, LV_ANIM_ON);
+        }
+    }
+}
+
+static void update_results_display(void)
+{
+    if (result_meal_name) {
+        lv_label_set_text(result_meal_name, meal_label[0] ? meal_label : "Unknown Food");
+    }
+
+    if (result_weight) {
+        char weight_str[32];
+        snprintf(weight_str, sizeof(weight_str), "%.1f g", meal_weight);
+        lv_label_set_text(result_weight, weight_str);
+    }
+
+    if (result_calories) {
+        char cal_str[32];
+        snprintf(cal_str, sizeof(cal_str), "%.0f kcal", meal_calories);
+        lv_label_set_text(result_calories, cal_str);
+    }
+
+    if (result_protein) {
+        char protein_str[32];
+        snprintf(protein_str, sizeof(protein_str), "%.1f g", meal_protein);
+        lv_label_set_text(result_protein, protein_str);
+    }
+
+    if (result_carbs) {
+        char carbs_str[32];
+        snprintf(carbs_str, sizeof(carbs_str), "%.1f g", meal_carbs);
+        lv_label_set_text(result_carbs, carbs_str);
+    }
+
+    if (result_fat) {
+        char fat_str[32];
+        snprintf(fat_str, sizeof(fat_str), "%.1f g", meal_fat);
+        lv_label_set_text(result_fat, fat_str);
     }
 }
 
@@ -857,17 +1316,27 @@ static void create_camera_ui(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0E27), LV_PART_MAIN);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* Create tabview */
+    tabview = lv_tabview_create(scr);
+    lv_obj_set_size(tabview, HOR_RES, VER_RES - 40);
+    lv_obj_align(tabview, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(tabview, lv_color_hex(0x0A0E27), LV_PART_MAIN);
+    lv_obj_set_style_border_width(tabview, 0, LV_PART_MAIN);
+    lv_tabview_set_tab_bar_size(tabview, 0); // Hide default tab bar
+
     /* Title */
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "ESP32 Camera Server");
+    lv_label_set_text(title, "ESP32 Smart Scale");
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    // Use default font
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+    /* Tab 1: Capture */
+    tab_capture = lv_tabview_add_tab(tabview, "");
 
     /* Status card */
-    lv_obj_t *status_card = lv_obj_create(scr);
+    lv_obj_t *status_card = lv_obj_create(tab_capture);
     lv_obj_set_size(status_card, 440, 80);
-    lv_obj_align(status_card, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_align(status_card, LV_ALIGN_TOP_MID, 0, 10);
     lv_obj_set_style_bg_color(status_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
     lv_obj_set_style_border_width(status_card, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(status_card, lv_color_hex(0x667EEA), LV_PART_MAIN);
@@ -885,7 +1354,7 @@ static void create_camera_ui(void)
     lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 10, 30);
 
     /* Weight card */
-    lv_obj_t *weight_card = lv_obj_create(scr);
+    lv_obj_t *weight_card = lv_obj_create(tab_capture);
     lv_obj_set_size(weight_card, 440, 80);
     lv_obj_align_to(weight_card, status_card, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_set_style_bg_color(weight_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
@@ -902,11 +1371,10 @@ static void create_camera_ui(void)
     weight_label = lv_label_create(weight_card);
     lv_label_set_text(weight_label, "-- g");
     lv_obj_set_style_text_color(weight_label, lv_color_hex(0x4ECDC4), 0);
-    // Use default font
     lv_obj_align(weight_label, LV_ALIGN_TOP_LEFT, 10, 30);
 
     /* Capture button */
-    capture_btn = lv_button_create(scr);
+    capture_btn = lv_button_create(tab_capture);
     lv_obj_set_size(capture_btn, 200, 60);
     lv_obj_align(capture_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_obj_set_style_bg_color(capture_btn, lv_color_hex(0x2196F3), LV_PART_MAIN);
@@ -914,11 +1382,87 @@ static void create_camera_ui(void)
     lv_obj_add_event_cb(capture_btn, capture_btn_handler, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *btn_label = lv_label_create(capture_btn);
-    lv_label_set_text(btn_label, "CAPTURE");
+    lv_label_set_text(btn_label, "CAPTURE MEAL");
     lv_obj_set_style_text_color(btn_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(btn_label);
 
-    ESP_LOGI(TAG, "Camera UI created");
+    /* Tab 2: Results */
+    tab_results = lv_tabview_add_tab(tabview, "");
+
+    /* Results page title */
+    lv_obj_t *results_title = lv_label_create(tab_results);
+    lv_label_set_text(results_title, "Meal Analysis Results");
+    lv_obj_set_style_text_color(results_title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(results_title, LV_ALIGN_TOP_MID, 0, 10);
+
+    /* Meal name card */
+    lv_obj_t *meal_name_card = lv_obj_create(tab_results);
+    lv_obj_set_size(meal_name_card, 440, 60);
+    lv_obj_align(meal_name_card, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(meal_name_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
+    lv_obj_set_style_border_width(meal_name_card, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(meal_name_card, lv_color_hex(0xFF6B6B), LV_PART_MAIN);
+    lv_obj_set_style_radius(meal_name_card, 10, LV_PART_MAIN);
+    lv_obj_clear_flag(meal_name_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *meal_name_label = lv_label_create(meal_name_card);
+    lv_label_set_text(meal_name_label, "Food Item");
+    lv_obj_set_style_text_color(meal_name_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(meal_name_label, LV_ALIGN_TOP_LEFT, 10, 5);
+
+    result_meal_name = lv_label_create(meal_name_card);
+    lv_label_set_text(result_meal_name, "No data yet");
+    lv_obj_set_style_text_color(result_meal_name, lv_color_hex(0xFF6B6B), 0);
+    lv_obj_align(result_meal_name, LV_ALIGN_TOP_LEFT, 10, 25);
+
+    /* Nutritional info cards */
+    const char* nutrient_labels[] = {"Weight", "Calories", "Protein", "Carbs", "Fat"};
+    lv_color_t nutrient_colors[] = {
+        lv_color_hex(0x4ECDC4), lv_color_hex(0xFFE66D),
+        lv_color_hex(0xFF6B6B), lv_color_hex(0xA78BFA), lv_color_hex(0xF093FB)
+    };
+
+    lv_obj_t *last_card = meal_name_card;
+    lv_obj_t **result_labels[] = {&result_weight, &result_calories, &result_protein, &result_carbs, &result_fat};
+
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *nutrient_card = lv_obj_create(tab_results);
+        lv_obj_set_size(nutrient_card, 210, 70);
+        lv_obj_align_to(nutrient_card, last_card, LV_ALIGN_OUT_BOTTOM_LEFT,
+                       (i % 2 == 0) ? 0 : 230, (i % 2 == 0) ? 10 : -70);
+        lv_obj_set_style_bg_color(nutrient_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
+        lv_obj_set_style_border_width(nutrient_card, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_color(nutrient_card, nutrient_colors[i], LV_PART_MAIN);
+        lv_obj_set_style_radius(nutrient_card, 10, LV_PART_MAIN);
+        lv_obj_clear_flag(nutrient_card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *nutrient_title = lv_label_create(nutrient_card);
+        lv_label_set_text(nutrient_title, nutrient_labels[i]);
+        lv_obj_set_style_text_color(nutrient_title, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(nutrient_title, LV_ALIGN_TOP_LEFT, 10, 5);
+
+        *result_labels[i] = lv_label_create(nutrient_card);
+        lv_label_set_text(*result_labels[i], "--");
+        lv_obj_set_style_text_color(*result_labels[i], nutrient_colors[i], 0);
+        lv_obj_align(*result_labels[i], LV_ALIGN_TOP_LEFT, 10, 30);
+
+        last_card = nutrient_card;
+    }
+
+    /* Back to capture button */
+    lv_obj_t *back_btn = lv_button_create(tab_results);
+    lv_obj_set_size(back_btn, 180, 50);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x667EEA), LV_PART_MAIN);
+    lv_obj_set_style_radius(back_btn, 10, LV_PART_MAIN);
+    lv_obj_add_event_cb(back_btn, back_to_capture_handler, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_label = lv_label_create(back_btn);
+    lv_label_set_text(back_label, "CAPTURE ANOTHER");
+    lv_obj_set_style_text_color(back_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_label);
+
+    ESP_LOGI(TAG, "Camera UI with tabs created");
 }
 
 static void lvgl_task(void *arg)
@@ -1052,6 +1596,26 @@ void app_main(void)
     lv_display_set_flush_cb(disp, ili9488_flush);
     lv_display_set_draw_buffers(disp, &draw_buf1, &draw_buf2);
     lv_display_set_render_mode(disp, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+    /* Initialize touch controller */
+    ESP_LOGI(TAG, "Initializing I2C for touch controller...");
+    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_LOGI(TAG, "I2C master initialized for touch controller");
+
+    touch_reset();
+    touch_interrupt_init();
+    ESP_ERROR_CHECK(ft6206_init(TOUCH_THRESHOLD));
+    ESP_LOGI(TAG, "FT6206 touch controller initialized");
+
+    /* Register touch input device with LVGL */
+    lv_indev_t *indev = lv_indev_create();
+    if (!indev) {
+        ESP_LOGE(TAG, "lv_indev_create failed");
+        return;
+    }
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, touch_read_cb);
+    ESP_LOGI(TAG, "Touch input device registered");
 
     ESP_LOGI(TAG, "Initializing HX711 load cell...");
     hx711_init();
