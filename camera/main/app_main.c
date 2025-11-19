@@ -28,7 +28,7 @@
 #define TAG "camera_server"
 
 // ---- LVGL Display configuration ----
-// Force recompilation after font fixes
+// Force recompilation after UI fixes
 #define HOR_RES 480
 #define VER_RES 320
 
@@ -89,6 +89,8 @@ static bool ui_status_update = false;
 static lv_obj_t *tabview = NULL;
 static lv_obj_t *tab_capture = NULL;
 static lv_obj_t *tab_results = NULL;
+static lv_obj_t *loading_screen = NULL;
+static lv_obj_t *spinner = NULL;
 
 // ---- Meal data globals ----
 static char meal_label[256] = "";
@@ -117,6 +119,8 @@ static void update_ui_status(const char *message)
 
 // ---- Function prototypes ----
 static void update_results_display(void);
+static void show_loading_screen(void);
+static void hide_loading_screen(void);
 
 // ---- JSON Parsing functions ----
 static const char* find_json_value(const char* json_str, const char* key) {
@@ -900,6 +904,9 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, doub
             // Update results display with parsed data
             update_results_display();
 
+            // Hide loading screen
+            hide_loading_screen();
+
             // Switch to results tab
             if (tabview) {
                 lv_tabview_set_active(tabview, 1, LV_ANIM_ON);
@@ -908,6 +915,9 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, doub
             update_ui_status("Meal analyzed successfully!");
         } else {
             // ---- ERROR CASE ----
+            // Hide loading screen on error
+            hide_loading_screen();
+
             char status_msg[64];
             snprintf(status_msg, sizeof(status_msg), "Upload error - HTTP %d", status);
             update_ui_status(status_msg);
@@ -915,6 +925,9 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, doub
 
     } else {
         // ---- NETWORK ERROR ----
+        // Hide loading screen on network error
+        hide_loading_screen();
+
         ESP_LOGE(TAG, "HTTP POST failed: %d", err);
 
         // Log more details about the error
@@ -1254,6 +1267,12 @@ static void capture_btn_handler(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED) {
         ESP_LOGI(TAG, "Capture button pressed - triggering capture");
+        // Show loading screen
+        show_loading_screen();
+        // Force display update to show loading screen immediately
+        lv_refr_now(NULL);
+        // Small delay to ensure loading screen is visible
+        vTaskDelay(pdMS_TO_TICKS(50));
         // Trigger the same capture functionality as the web endpoint
         trigger_capture();
     }
@@ -1268,6 +1287,43 @@ static void back_to_capture_handler(lv_event_t *e)
         if (tabview) {
             lv_tabview_set_active(tabview, 0, LV_ANIM_ON);
         }
+    }
+}
+
+static void show_loading_screen(void)
+{
+    if (!loading_screen) {
+        lv_obj_t *scr = lv_screen_active();
+
+        // Create loading overlay
+        loading_screen = lv_obj_create(scr);
+        lv_obj_set_size(loading_screen, HOR_RES, VER_RES);
+        lv_obj_align(loading_screen, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_bg_color(loading_screen, lv_color_hex(0x0A0E27), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(loading_screen, LV_OPA_90, LV_PART_MAIN);
+        lv_obj_clear_flag(loading_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Loading text
+        lv_obj_t *loading_text = lv_label_create(loading_screen);
+        lv_label_set_text(loading_text, "Analyzing Meal...");
+        lv_obj_set_style_text_color(loading_text, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(loading_text, LV_ALIGN_TOP_MID, 0, 120);
+
+        // Spinner
+        spinner = lv_spinner_create(loading_screen);
+        lv_obj_set_size(spinner, 60, 60);
+        lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 20);
+        lv_obj_set_style_arc_color(spinner, lv_color_hex(0x2196F3), LV_PART_INDICATOR);
+    }
+
+    lv_obj_clear_flag(loading_screen, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(loading_screen);
+}
+
+static void hide_loading_screen(void)
+{
+    if (loading_screen) {
+        lv_obj_add_flag(loading_screen, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -1316,27 +1372,27 @@ static void create_camera_ui(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0E27), LV_PART_MAIN);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Create tabview */
+    /* Create tabview - full screen height */
     tabview = lv_tabview_create(scr);
-    lv_obj_set_size(tabview, HOR_RES, VER_RES - 40);
-    lv_obj_align(tabview, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_size(tabview, HOR_RES, VER_RES);
+    lv_obj_align(tabview, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_color(tabview, lv_color_hex(0x0A0E27), LV_PART_MAIN);
     lv_obj_set_style_border_width(tabview, 0, LV_PART_MAIN);
     lv_tabview_set_tab_bar_size(tabview, 0); // Hide default tab bar
 
-    /* Title */
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "ESP32 Smart Scale");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
-
     /* Tab 1: Capture */
     tab_capture = lv_tabview_add_tab(tabview, "");
 
-    /* Status card */
+    /* Title for capture tab */
+    lv_obj_t *capture_title = lv_label_create(tab_capture);
+    lv_label_set_text(capture_title, "ESP32 Smart Scale");
+    lv_obj_set_style_text_color(capture_title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(capture_title, LV_ALIGN_TOP_MID, 0, 15);
+
+    /* Status card - positioned nicely */
     lv_obj_t *status_card = lv_obj_create(tab_capture);
-    lv_obj_set_size(status_card, 440, 80);
-    lv_obj_align(status_card, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_set_size(status_card, 420, 75);
+    lv_obj_align(status_card, LV_ALIGN_TOP_MID, 0, 50);
     lv_obj_set_style_bg_color(status_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
     lv_obj_set_style_border_width(status_card, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(status_card, lv_color_hex(0x667EEA), LV_PART_MAIN);
@@ -1346,17 +1402,17 @@ static void create_camera_ui(void)
     lv_obj_t *status_title = lv_label_create(status_card);
     lv_label_set_text(status_title, "Status");
     lv_obj_set_style_text_color(status_title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(status_title, LV_ALIGN_TOP_LEFT, 10, 5);
+    lv_obj_align(status_title, LV_ALIGN_TOP_LEFT, 15, 8);
 
     status_label = lv_label_create(status_card);
     lv_label_set_text(status_label, "Initializing...");
     lv_obj_set_style_text_color(status_label, lv_color_hex(0x9CA3AF), 0);
-    lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 10, 30);
+    lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 15, 30);
 
-    /* Weight card */
+    /* Weight card - positioned below status */
     lv_obj_t *weight_card = lv_obj_create(tab_capture);
-    lv_obj_set_size(weight_card, 440, 80);
-    lv_obj_align_to(weight_card, status_card, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+    lv_obj_set_size(weight_card, 420, 75);
+    lv_obj_align_to(weight_card, status_card, LV_ALIGN_OUT_BOTTOM_MID, 0, 15);
     lv_obj_set_style_bg_color(weight_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
     lv_obj_set_style_border_width(weight_card, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(weight_card, lv_color_hex(0x4ECDC4), LV_PART_MAIN);
@@ -1366,17 +1422,17 @@ static void create_camera_ui(void)
     lv_obj_t *weight_title = lv_label_create(weight_card);
     lv_label_set_text(weight_title, "Current Weight");
     lv_obj_set_style_text_color(weight_title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(weight_title, LV_ALIGN_TOP_LEFT, 10, 5);
+    lv_obj_align(weight_title, LV_ALIGN_TOP_LEFT, 15, 8);
 
     weight_label = lv_label_create(weight_card);
     lv_label_set_text(weight_label, "-- g");
     lv_obj_set_style_text_color(weight_label, lv_color_hex(0x4ECDC4), 0);
-    lv_obj_align(weight_label, LV_ALIGN_TOP_LEFT, 10, 30);
+    lv_obj_align(weight_label, LV_ALIGN_TOP_LEFT, 15, 30);
 
-    /* Capture button */
+    /* Capture button - centered at bottom */
     capture_btn = lv_button_create(tab_capture);
     lv_obj_set_size(capture_btn, 200, 60);
-    lv_obj_align(capture_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_align(capture_btn, LV_ALIGN_BOTTOM_MID, 0, -30);
     lv_obj_set_style_bg_color(capture_btn, lv_color_hex(0x2196F3), LV_PART_MAIN);
     lv_obj_set_style_radius(capture_btn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(capture_btn, capture_btn_handler, LV_EVENT_CLICKED, NULL);
@@ -1393,66 +1449,56 @@ static void create_camera_ui(void)
     lv_obj_t *results_title = lv_label_create(tab_results);
     lv_label_set_text(results_title, "Meal Analysis Results");
     lv_obj_set_style_text_color(results_title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(results_title, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_align(results_title, LV_ALIGN_TOP_MID, 0, 15);
 
-    /* Meal name card */
-    lv_obj_t *meal_name_card = lv_obj_create(tab_results);
-    lv_obj_set_size(meal_name_card, 440, 60);
-    lv_obj_align(meal_name_card, LV_ALIGN_TOP_MID, 0, 40);
-    lv_obj_set_style_bg_color(meal_name_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
-    lv_obj_set_style_border_width(meal_name_card, 2, LV_PART_MAIN);
-    lv_obj_set_style_border_color(meal_name_card, lv_color_hex(0xFF6B6B), LV_PART_MAIN);
-    lv_obj_set_style_radius(meal_name_card, 10, LV_PART_MAIN);
-    lv_obj_clear_flag(meal_name_card, LV_OBJ_FLAG_SCROLLABLE);
+    /* Main results card - single card containing all info */
+    lv_obj_t *results_card = lv_obj_create(tab_results);
+    lv_obj_set_size(results_card, 440, 200);
+    lv_obj_align(results_card, LV_ALIGN_TOP_MID, 0, 45);
+    lv_obj_set_style_bg_color(results_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
+    lv_obj_set_style_border_width(results_card, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(results_card, lv_color_hex(0x667EEA), LV_PART_MAIN);
+    lv_obj_set_style_radius(results_card, 10, LV_PART_MAIN);
+    lv_obj_clear_flag(results_card, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *meal_name_label = lv_label_create(meal_name_card);
-    lv_label_set_text(meal_name_label, "Food Item");
-    lv_obj_set_style_text_color(meal_name_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(meal_name_label, LV_ALIGN_TOP_LEFT, 10, 5);
+    /* Food name */
+    lv_obj_t *food_label = lv_label_create(results_card);
+    lv_label_set_text(food_label, "Food:");
+    lv_obj_set_style_text_color(food_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(food_label, LV_ALIGN_TOP_LEFT, 15, 10);
 
-    result_meal_name = lv_label_create(meal_name_card);
+    result_meal_name = lv_label_create(results_card);
     lv_label_set_text(result_meal_name, "No data yet");
     lv_obj_set_style_text_color(result_meal_name, lv_color_hex(0xFF6B6B), 0);
-    lv_obj_align(result_meal_name, LV_ALIGN_TOP_LEFT, 10, 25);
+    lv_obj_align(result_meal_name, LV_ALIGN_TOP_LEFT, 80, 10);
 
-    /* Nutritional info cards */
-    const char* nutrient_labels[] = {"Weight", "Calories", "Protein", "Carbs", "Fat"};
+    /* Nutrition info in simple list format */
+    const char* nutrient_names[] = {"Weight:", "Calories:", "Protein:", "Carbs:", "Fat:"};
     lv_color_t nutrient_colors[] = {
         lv_color_hex(0x4ECDC4), lv_color_hex(0xFFE66D),
         lv_color_hex(0xFF6B6B), lv_color_hex(0xA78BFA), lv_color_hex(0xF093FB)
     };
 
-    lv_obj_t *last_card = meal_name_card;
     lv_obj_t **result_labels[] = {&result_weight, &result_calories, &result_protein, &result_carbs, &result_fat};
 
     for (int i = 0; i < 5; i++) {
-        lv_obj_t *nutrient_card = lv_obj_create(tab_results);
-        lv_obj_set_size(nutrient_card, 210, 70);
-        lv_obj_align_to(nutrient_card, last_card, LV_ALIGN_OUT_BOTTOM_LEFT,
-                       (i % 2 == 0) ? 0 : 230, (i % 2 == 0) ? 10 : -70);
-        lv_obj_set_style_bg_color(nutrient_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
-        lv_obj_set_style_border_width(nutrient_card, 2, LV_PART_MAIN);
-        lv_obj_set_style_border_color(nutrient_card, nutrient_colors[i], LV_PART_MAIN);
-        lv_obj_set_style_radius(nutrient_card, 10, LV_PART_MAIN);
-        lv_obj_clear_flag(nutrient_card, LV_OBJ_FLAG_SCROLLABLE);
+        /* Nutrient label */
+        lv_obj_t *nutrient_label = lv_label_create(results_card);
+        lv_label_set_text(nutrient_label, nutrient_names[i]);
+        lv_obj_set_style_text_color(nutrient_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(nutrient_label, LV_ALIGN_TOP_LEFT, 15, 35 + i * 25);
 
-        lv_obj_t *nutrient_title = lv_label_create(nutrient_card);
-        lv_label_set_text(nutrient_title, nutrient_labels[i]);
-        lv_obj_set_style_text_color(nutrient_title, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_align(nutrient_title, LV_ALIGN_TOP_LEFT, 10, 5);
-
-        *result_labels[i] = lv_label_create(nutrient_card);
+        /* Nutrient value */
+        *result_labels[i] = lv_label_create(results_card);
         lv_label_set_text(*result_labels[i], "--");
         lv_obj_set_style_text_color(*result_labels[i], nutrient_colors[i], 0);
-        lv_obj_align(*result_labels[i], LV_ALIGN_TOP_LEFT, 10, 30);
-
-        last_card = nutrient_card;
+        lv_obj_align(*result_labels[i], LV_ALIGN_TOP_LEFT, 100, 35 + i * 25);
     }
 
-    /* Back to capture button */
+    /* Back to capture button - positioned below the results card */
     lv_obj_t *back_btn = lv_button_create(tab_results);
-    lv_obj_set_size(back_btn, 180, 50);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_set_size(back_btn, 200, 50);
+    lv_obj_align_to(back_btn, results_card, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x667EEA), LV_PART_MAIN);
     lv_obj_set_style_radius(back_btn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(back_btn, back_to_capture_handler, LV_EVENT_CLICKED, NULL);
@@ -1462,7 +1508,7 @@ static void create_camera_ui(void)
     lv_obj_set_style_text_color(back_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(back_label);
 
-    ESP_LOGI(TAG, "Camera UI with tabs created");
+    ESP_LOGI(TAG, "Camera UI with proper alignment created");
 }
 
 static void lvgl_task(void *arg)
