@@ -1,6 +1,7 @@
 #include "ArducamCamera.h"
 #include "ArducamLink.h"
 #include "delay.h"
+#include "diagnostics.h"
 #include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
@@ -1558,6 +1559,9 @@ void app_main(void)
     uartBegin(115200);
     ESP_LOGI(TAG, "ESP32 Camera Server starting...");
 
+    // Initialize diagnostics module
+    diagnostics_init();
+
     // Initialize display
     ESP_LOGI(TAG, "Initializing display...");
     gpio_config_t io = {0};
@@ -1697,9 +1701,23 @@ void app_main(void)
         update_ui_status("Web server failed!");
     }
 
-    // Keep camera alive
+    // Keep camera alive and run periodic diagnostics
+    uint32_t diagnostic_counter = 0;
+    const uint32_t DIAGNOSTICS_INTERVAL_MS = 30000; // 30 seconds
+    const uint32_t DIAGNOSTICS_TICKS = DIAGNOSTICS_INTERVAL_MS / portTICK_PERIOD_MS;
+
     while (1) {
         captureThread(&myCAM);
+
+        // Run diagnostics every 30 seconds
+        if (diagnostic_counter >= DIAGNOSTICS_TICKS) {
+            ESP_LOGI(TAG, "Running periodic diagnostics...");
+            diagnostics_print_heap_stats();
+            diagnostics_print_task_stats();
+            diagnostic_counter = 0;
+        }
+
+        diagnostic_counter++;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
