@@ -20,11 +20,16 @@
 #include <string.h>
 
 
-// Display includes
-#include "font6x8.h"
+// LVGL includes
+#include "lvgl.h"
 #include "driver/spi_master.h"
 
 #define TAG "camera_server"
+
+// ---- LVGL Display configuration ----
+// Force recompilation after font fixes
+#define HOR_RES 480
+#define VER_RES 320
 
 // ---- Display pins ----
 #define PIN_TFT_MOSI   23
@@ -43,7 +48,7 @@
 #define MAXIMUM_RETRY 5
 
 // ---- HTTP upload config (change URL/token) ----
-static const char *UPLOAD_URL = "http://192.168.0.6:8000/api/v1/meal_logs/";
+static const char *UPLOAD_URL = "http://192.168.0.4:8000/api/v1/meal_logs/";
 static const char *AUTH_HEADER_VALUE = "Bearer iKnCz7E2Mtfl_V0bDcasJWDMzVN39L_BCySvj1hLDSc";
 
 // ---- Camera globals ----
@@ -51,8 +56,24 @@ ArducamCamera myCAM;
 const int CS_PIN = 33;
 static httpd_handle_t server = NULL;
 
-// ---- Display globals ----
+// ---- LVGL Display globals ----
 spi_device_handle_t tft_spi = NULL;
+static lv_display_t *disp = NULL;
+static lv_color_t *lv_buf1 = NULL;
+static lv_color_t *lv_buf2 = NULL;
+static uint8_t *rgb666_buf = NULL;
+
+// ---- UI Status globals ----
+static char ui_status_message[128] = "Initializing...";
+static bool ui_status_update = false;
+
+// ---- UI Status functions ----
+static void update_ui_status(const char *message)
+{
+    strncpy(ui_status_message, message, sizeof(ui_status_message) - 1);
+    ui_status_message[sizeof(ui_status_message) - 1] = '\0';
+    ui_status_update = true;
+}
 
 // ---- HX711 globals ----
 static long hx711_offset = 0;           // raw zero point (set by tare)
@@ -65,26 +86,79 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static int s_retry_num = 0;
 
-// ---- Display functions ----
-void ili9488_send_cmd(uint8_t cmd)
+// ---- LVGL Display functions ----
+
+// RGB565 to RGB666 conversion lookup tables (from LVGL example)
+static const uint8_t rgb565_r_lut[32] = {
+    0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38,
+    0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78,
+    0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8,
+    0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8
+};
+
+static const uint8_t rgb565_g_lut[64] = {
+    0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C,
+    0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C,
+    0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C,
+    0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C,
+    0x80, 0x84, 0x88, 0x8C, 0x90, 0x94, 0x98, 0x9C,
+    0xA0, 0xA4, 0xA8, 0xAC, 0xB0, 0xB4, 0xB8, 0xBC,
+    0xC0, 0xC4, 0xC8, 0xCC, 0xD0, 0xD4, 0xD8, 0xDC,
+    0xE0, 0xE4, 0xE8, 0xEC, 0xF0, 0xF4, 0xF8, 0xFC
+};
+
+static const uint8_t rgb565_b_lut[32] = {
+    0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38,
+    0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78,
+    0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8,
+    0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8
+};
+
+// Low-level SPI helpers
+static void send_cmd(uint8_t cmd)
 {
     gpio_set_level(PIN_TFT_DC, 0);
     spi_transaction_t t = {0};
     t.length = 8;
-    t.tx_buffer = &cmd;
-    spi_device_polling_transmit(tft_spi, &t);
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = cmd;
+    t.rxlength = 0;
+    esp_err_t err = spi_device_polling_transmit(tft_spi, &t);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "send_cmd spi tx err %s", esp_err_to_name(err));
+    }
 }
 
-void ili9488_send_data(uint8_t data)
+static void send_data_chunked(const uint8_t *data, size_t len)
 {
+    if (!data || len == 0) return;
     gpio_set_level(PIN_TFT_DC, 1);
+
     spi_transaction_t t = {0};
-    t.length = 8;
-    t.tx_buffer = &data;
-    spi_device_polling_transmit(tft_spi, &t);
+    size_t sent = 0;
+
+    while (sent < len) {
+        size_t to_send = len - sent;
+        if (to_send > 16384) {  // MAX_SPI_TRANS_BYTES equivalent
+            to_send = 16384;
+        }
+
+        t = (spi_transaction_t){0};
+        t.length = to_send * 8;
+        t.tx_buffer = data + sent;
+        t.rxlength = 0;
+
+        esp_err_t err = spi_device_polling_transmit(tft_spi, &t);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "send_data_chunked spi tx err %s", esp_err_to_name(err));
+            break;
+        }
+        sent += to_send;
+    }
 }
 
-void ili9488_init(void)
+// ILI9488 initialization
+static void ili9488_init(void)
 {
     ESP_LOGI(TAG, "Resetting display...");
     gpio_set_level(PIN_TFT_RST, 0);
@@ -94,164 +168,96 @@ void ili9488_init(void)
 
     ESP_LOGI(TAG, "Sending ILI9488 init...");
 
-    ili9488_send_cmd(0x11);     // Sleep Out
+    send_cmd(0x11); // Sleep Out
     vTaskDelay(pdMS_TO_TICKS(120));
 
-    ili9488_send_cmd(0x36);     // Memory Access Control
-    ili9488_send_data(0xE8);   // Landscape rotation (same as TFT_eSPI rotation=3)
+    send_cmd(0x36); // MADCTL
+    uint8_t madctl = 0xE8; // landscape
+    send_data_chunked(&madctl, 1);
 
-    ili9488_send_cmd(0x3A);     // Pixel Format
-    ili9488_send_data(0x66);    // 18-bit/pixel mode (RGB666)
+    send_cmd(0x3A); // Pixel format
+    uint8_t pix = 0x66; // RGB666
+    send_data_chunked(&pix, 1);
 
-    ili9488_send_cmd(0x29);     // Display On
-    vTaskDelay(pdMS_TO_TICKS(10));
+    send_cmd(0x29); // Display ON
+    vTaskDelay(pdMS_TO_TICKS(20));
 }
 
-void drawPixel(int x, int y, uint16_t color565)
+// Fast RGB565 to RGB666 conversion
+static inline void rgb565_to_rgb666_optimized(const uint16_t *src, uint8_t *dst, int count)
 {
-    if (x < 0 || x >= 480 || y < 0 || y >= 320) return;
+    int i = 0;
+    const int unroll_count = count & ~15;
 
-    uint8_t r5 = (color565 >> 11) & 0x1F;
-    uint8_t g6 = (color565 >> 5) & 0x3F;
-    uint8_t b5 =  color565       & 0x1F;
+    for (; i < unroll_count; i += 16) {
+        uint16_t c0 = src[i], c1 = src[i+1], c2 = src[i+2], c3 = src[i+3];
+        uint16_t c4 = src[i+4], c5 = src[i+5], c6 = src[i+6], c7 = src[i+7];
+        uint16_t c8 = src[i+8], c9 = src[i+9], c10 = src[i+10], c11 = src[i+11];
+        uint16_t c12 = src[i+12], c13 = src[i+13], c14 = src[i+14], c15 = src[i+15];
 
-    uint8_t R = r5 << 3;
-    uint8_t G = g6 << 2;
-    uint8_t B = b5 << 3;
+        uint8_t *d = dst + 3*i;
 
-    // Column (0..479)
-    ili9488_send_cmd(0x2A);
-    ili9488_send_data(x >> 8);
-    ili9488_send_data(x & 0xFF);
-    ili9488_send_data(x >> 8);
-    ili9488_send_data(x & 0xFF);
+        d[0] = rgb565_r_lut[(c0 >> 11) & 0x1F]; d[1] = rgb565_g_lut[(c0 >> 5) & 0x3F]; d[2] = rgb565_b_lut[c0 & 0x1F];
+        d[3] = rgb565_r_lut[(c1 >> 11) & 0x1F]; d[4] = rgb565_g_lut[(c1 >> 5) & 0x3F]; d[5] = rgb565_b_lut[c1 & 0x1F];
+        d[6] = rgb565_r_lut[(c2 >> 11) & 0x1F]; d[7] = rgb565_g_lut[(c2 >> 5) & 0x3F]; d[8] = rgb565_b_lut[c2 & 0x1F];
+        d[9] = rgb565_r_lut[(c3 >> 11) & 0x1F]; d[10] = rgb565_g_lut[(c3 >> 5) & 0x3F]; d[11] = rgb565_b_lut[c3 & 0x1F];
+        d[12] = rgb565_r_lut[(c4 >> 11) & 0x1F]; d[13] = rgb565_g_lut[(c4 >> 5) & 0x3F]; d[14] = rgb565_b_lut[c4 & 0x1F];
+        d[15] = rgb565_r_lut[(c5 >> 11) & 0x1F]; d[16] = rgb565_g_lut[(c5 >> 5) & 0x3F]; d[17] = rgb565_b_lut[c5 & 0x1F];
+        d[18] = rgb565_r_lut[(c6 >> 11) & 0x1F]; d[19] = rgb565_g_lut[(c6 >> 5) & 0x3F]; d[20] = rgb565_b_lut[c6 & 0x1F];
+        d[21] = rgb565_r_lut[(c7 >> 11) & 0x1F]; d[22] = rgb565_g_lut[(c7 >> 5) & 0x3F]; d[23] = rgb565_b_lut[c7 & 0x1F];
+        d[24] = rgb565_r_lut[(c8 >> 11) & 0x1F]; d[25] = rgb565_g_lut[(c8 >> 5) & 0x3F]; d[26] = rgb565_b_lut[c8 & 0x1F];
+        d[27] = rgb565_r_lut[(c9 >> 11) & 0x1F]; d[28] = rgb565_g_lut[(c9 >> 5) & 0x3F]; d[29] = rgb565_b_lut[c9 & 0x1F];
+        d[30] = rgb565_r_lut[(c10 >> 11) & 0x1F]; d[31] = rgb565_g_lut[(c10 >> 5) & 0x3F]; d[32] = rgb565_b_lut[c10 & 0x1F];
+        d[33] = rgb565_r_lut[(c11 >> 11) & 0x1F]; d[34] = rgb565_g_lut[(c11 >> 5) & 0x3F]; d[35] = rgb565_b_lut[c11 & 0x1F];
+        d[36] = rgb565_r_lut[(c12 >> 11) & 0x1F]; d[37] = rgb565_g_lut[(c12 >> 5) & 0x3F]; d[38] = rgb565_b_lut[c12 & 0x1F];
+        d[39] = rgb565_r_lut[(c13 >> 11) & 0x1F]; d[40] = rgb565_g_lut[(c13 >> 5) & 0x3F]; d[41] = rgb565_b_lut[c13 & 0x1F];
+        d[42] = rgb565_r_lut[(c14 >> 11) & 0x1F]; d[43] = rgb565_g_lut[(c14 >> 5) & 0x3F]; d[44] = rgb565_b_lut[c14 & 0x1F];
+        d[45] = rgb565_r_lut[(c15 >> 11) & 0x1F]; d[46] = rgb565_g_lut[(c15 >> 5) & 0x3F]; d[47] = rgb565_b_lut[c15 & 0x1F];
+    }
 
-    // Row (0..319)
-    ili9488_send_cmd(0x2B);
-    ili9488_send_data(y >> 8);
-    ili9488_send_data(y & 0xFF);
-    ili9488_send_data(y >> 8);
-    ili9488_send_data(y & 0xFF);
-
-    // Memory write
-    ili9488_send_cmd(0x2C);
-    gpio_set_level(PIN_TFT_DC, 1);
-
-    uint8_t px[3] = {R, G, B};
-
-    spi_transaction_t t = {0};
-    t.length = 24;
-    t.tx_buffer = px;
-
-    spi_device_polling_transmit(tft_spi, &t);
+    for (; i < count; i++) {
+        uint16_t c = src[i];
+        uint8_t *d = dst + 3*i;
+        d[0] = rgb565_r_lut[(c >> 11) & 0x1F];
+        d[1] = rgb565_g_lut[(c >> 5) & 0x3F];
+        d[2] = rgb565_b_lut[c & 0x1F];
+    }
 }
 
-void drawChar(int x, int y, char c, uint16_t color, uint8_t scale)
+// LVGL flush callback
+static void ili9488_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    if (c < 32 || c > 126) return;
+    uint16_t *src = (uint16_t *)px_map;
+    int32_t w = lv_area_get_width(area);
+    int32_t h = lv_area_get_height(area);
+    int total = w * h;
 
-    const uint8_t *glyph = &font6x8[(c - 32) * 6];
+    // Convert RGB565 to RGB666
+    rgb565_to_rgb666_optimized(src, rgb666_buf, total);
 
-    for (int col = 0; col < 6; col++)
-    {
-        uint8_t line = glyph[col];
+    // Set column address (X coordinates)
+    uint8_t col[4] = {
+        (uint8_t)((area->x1 >> 8) & 0xFF), (uint8_t)(area->x1 & 0xFF),
+        (uint8_t)((area->x2 >> 8) & 0xFF), (uint8_t)(area->x2 & 0xFF)
+    };
+    send_cmd(0x2A);
+    send_data_chunked(col, 4);
 
-        for (int row = 0; row < 8; row++)
-        {
-            if (line & 1)
-            {
-                // Draw a scale x scale block
-                for (int dx = 0; dx < scale; dx++)
-                {
-                    for (int dy = 0; dy < scale; dy++)
-                    {
-                        drawPixel(x + col*scale + dx,
-                                  y + row*scale + dy,
-                                  color);
-                    }
-                }
-            }
+    // Set row address (Y coordinates)
+    uint8_t row[4] = {
+        (uint8_t)((area->y1 >> 8) & 0xFF), (uint8_t)(area->y1 & 0xFF),
+        (uint8_t)((area->y2 >> 8) & 0xFF), (uint8_t)(area->y2 & 0xFF)
+    };
+    send_cmd(0x2B);
+    send_data_chunked(row, 4);
 
-            line >>= 1;
-        }
-    }
+    // Send RGB666 pixel data (3 bytes per pixel)
+    send_cmd(0x2C);
+    send_data_chunked(rgb666_buf, total * 3);
+
+    lv_display_flush_ready(disp);
 }
 
-void drawText(int x, int y, const char *s, uint16_t color, uint8_t scale)
-{
-    while (*s)
-    {
-        drawChar(x, y, *s, color, scale);
-        x += 6 * scale;   // move ahead by scaled width
-        s++;
-    }
-}
-
-void fill_color(uint16_t color565)
-{
-    // 565 → 666 expand
-    uint8_t r5 = (color565 >> 11) & 0x1F;
-    uint8_t g6 = (color565 >> 5) & 0x3F;
-    uint8_t b5 =  color565       & 0x1F;
-
-    uint8_t R = r5 << 3;
-    uint8_t G = g6 << 2;
-    uint8_t B = b5 << 3;
-
-    const int total_pixels  = 480 * 320;
-    const int chunk_pixels  = 1200;
-    const int chunk_bytes   = chunk_pixels * 3;
-
-    uint8_t *buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_DMA);
-    if (!buf) {
-        ESP_LOGE(TAG, "DMA buffer alloc failed");
-        return;
-    }
-
-    for (int i = 0; i < chunk_pixels; i++) {
-        buf[3*i + 0] = R;
-        buf[3*i + 1] = G;
-        buf[3*i + 2] = B;
-    }
-
-    // Column (X): 0 → 479
-    ili9488_send_cmd(0x2A);
-    ili9488_send_data(0);
-    ili9488_send_data(0);
-    ili9488_send_data((480-1) >> 8);
-    ili9488_send_data((480-1) & 0xFF);
-
-    // Row (Y): 0 → 319
-    ili9488_send_cmd(0x2B);
-    ili9488_send_data(0);
-    ili9488_send_data(0);
-    ili9488_send_data((320-1) >> 8);
-    ili9488_send_data((320-1) & 0xFF);
-
-    // Memory write
-    ili9488_send_cmd(0x2C);
-    gpio_set_level(PIN_TFT_DC, 1);
-
-    spi_transaction_t t = {0};
-    t.tx_buffer = buf;
-
-    int sent = 0;
-    while (sent < total_pixels)
-    {
-        int to_send = (total_pixels - sent > chunk_pixels)
-                        ? chunk_pixels
-                        : (total_pixels - sent);
-
-        t.length = to_send * 24; // 24 bits = 3 bytes/pixel
-
-        spi_device_polling_transmit(tft_spi, &t);
-        sent += to_send;
-
-        vTaskDelay(pdMS_TO_TICKS(1)); // feed watchdog
-    }
-
-    heap_caps_free(buf);
-}
 
 // ---- HX711 Load Cell functions ----
 static void hx711_init(void) {
@@ -425,78 +431,6 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-// Helper function to extract value after key
-static const char* find_value(const char* key, const char* json_str) {
-    char search[32];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char* pos = strstr(json_str, search);
-    if (!pos) return NULL;
-
-    pos += strlen(search);
-    // Skip whitespace
-    while (*pos == ' ' || *pos == '\t' || *pos == '\n') pos++;
-
-    return pos;
-}
-
-void display_entry_data_from_y(const char *json, int start_y)
-{
-    int y = start_y;
-    char line[64];
-
-    // Extract and display key fields
-    #define EXTRACT_STRING(name, label) { \
-        const char* val = find_value(name, json); \
-        if (val && *val == '"') { \
-            val++; \
-            const char* end = strchr(val, '"'); \
-            if (end) { \
-                int len = end - val; \
-                if (len > 0 && len < 30) { \
-                    char value[31]; \
-                    memcpy(value, val, len); \
-                    value[len] = '\0'; \
-                    snprintf(line, sizeof(line), "%s: %s", label, value); \
-                    drawText(10, y, line, 0xFFFF, 2); \
-                    y += 25; \
-                } \
-            } \
-        } \
-    }
-
-    #define EXTRACT_NUMBER(name, label) { \
-        const char* val = find_value(name, json); \
-        if (val) { \
-            char num_str[16]; \
-            int i = 0; \
-            while (*val && *val != ',' && *val != '}' && i < 15) { \
-                num_str[i++] = *val++; \
-            } \
-            num_str[i] = '\0'; \
-            if (i > 0) { \
-                float num = atof(num_str); \
-                if (strstr(name, "weight")) { \
-                    snprintf(line, sizeof(line), "%s: %.1fg", label, num); \
-                } else if (strstr(name, "kcal")) { \
-                    snprintf(line, sizeof(line), "%s: %.0f kcal", label, num); \
-                } else { \
-                    snprintf(line, sizeof(line), "%s: %.1fg", label, num); \
-                } \
-                drawText(10, y, line, 0xFFFF, 2); \
-                y += 25; \
-            } \
-        } \
-    }
-
-    // Extract fields
-    EXTRACT_STRING("label", "Food");
-    EXTRACT_NUMBER("weight_g", "Weight");
-    EXTRACT_NUMBER("estimated_kcal", "Calories");
-    EXTRACT_NUMBER("protein_g", "Protein");
-    EXTRACT_NUMBER("carbs_g", "Carbs");
-    EXTRACT_NUMBER("fat_g", "Fat");
-}
-
 
 static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, double weight_grams)
 {
@@ -656,8 +590,9 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, doub
     }
 
     // Perform POST (response will be captured by event handler)
+    ESP_LOGI(TAG, "Attempting HTTP POST to: %s", url);
     err = esp_http_client_perform(client);
-    
+
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         int content_length = esp_http_client_get_content_length(client);
@@ -666,44 +601,46 @@ static esp_err_t send_image_to_server(const uint8_t *jpeg, size_t jpeg_len, doub
                  status, content_length);
     
         ESP_LOGI(TAG, "FastAPI Response (%d bytes): %s", response.len, response.buffer);
-    
-        // Prepare TFT screen
-        fill_color(0x0000); // Black background
-
-        char status_msg[32];
-        snprintf(status_msg, sizeof(status_msg), "HTTP Status: %d", status);
 
         if (status == 200 || status == 201) {
-            drawText(10, 10, "SUCCESS!", 0x07E0, 3);
-            drawText(10, 50, status_msg, 0x07E0, 2);
-
-            // Parse and display entry data (starting from y=80)
-            display_entry_data_from_y(response.buffer, 80);
+            update_ui_status("Upload successful!");
+            // Parse and display entry data would go here in a more complete implementation
         } else {
             // ---- ERROR CASE ----
-            drawText(10, 10, "ERROR!", 0xF800, 3);
-            drawText(10, 50, status_msg, 0xF800, 2);
-
-            drawText(10, 80, "SERVER RESPONSE:", 0xFFFF, 2);
-
-            char safe_resp[61];
-            int copy_len = (response.len > 60) ? 60 : response.len;
-            memcpy(safe_resp, response.buffer, copy_len);
-            safe_resp[copy_len] = '\0';
-
-            drawText(10, 110, safe_resp, 0xF800, 2);
+            char status_msg[64];
+            snprintf(status_msg, sizeof(status_msg), "Upload error - HTTP %d", status);
+            update_ui_status(status_msg);
         }
-    
+
     } else {
         // ---- NETWORK ERROR ----
         ESP_LOGE(TAG, "HTTP POST failed: %d", err);
-    
-        fill_color(0x0000);
-        drawText(10, 10, "UPLOAD FAILED!", 0xF800, 3);
 
-        char error_msg[32];
-        snprintf(error_msg, sizeof(error_msg), "Network Error: %d", err);
-        drawText(10, 50, error_msg, 0xF800, 2);
+        // Log more details about the error
+        switch(err) {
+            case ESP_ERR_HTTP_CONNECT:
+                ESP_LOGE(TAG, "Connection failed - check server IP/port and if server is running");
+                break;
+            case ESP_ERR_HTTP_WRITE_DATA:
+                ESP_LOGE(TAG, "Failed to write data to server");
+                break;
+            case ESP_ERR_HTTP_FETCH_HEADER:
+                ESP_LOGE(TAG, "Failed to fetch HTTP headers");
+                break;
+            case ESP_ERR_HTTP_INVALID_TRANSPORT:
+                ESP_LOGE(TAG, "Invalid transport");
+                break;
+            case ESP_ERR_HTTP_CONNECTING:
+                ESP_LOGE(TAG, "Still connecting...");
+                break;
+            default:
+                ESP_LOGE(TAG, "Unknown HTTP error: %d", err);
+                break;
+        }
+
+        char error_msg[64];
+        snprintf(error_msg, sizeof(error_msg), "Network error: %d", err);
+        update_ui_status(error_msg);
     }
     
 
@@ -889,6 +826,132 @@ void stop_preview(void)
     ESP_LOGI(TAG, "stop_preview() called");
 }
 
+/* -------------------------------------------------------------------
+ * LVGL tick
+ * -------------------------------------------------------------------*/
+static void tick_inc(void *arg)
+{
+    lv_tick_inc(1);
+}
+
+/* ---------- LVGL Task ---------- */
+
+static lv_obj_t *status_label = NULL;
+static lv_obj_t *weight_label = NULL;
+static lv_obj_t *capture_btn = NULL;
+
+static void capture_btn_handler(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        ESP_LOGI(TAG, "Capture button pressed");
+        // Capture will be handled by web server endpoint
+    }
+}
+
+static void create_camera_ui(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    /* Professional dark theme background */
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0E27), LV_PART_MAIN);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Title */
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "ESP32 Camera Server");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    // Use default font
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+
+    /* Status card */
+    lv_obj_t *status_card = lv_obj_create(scr);
+    lv_obj_set_size(status_card, 440, 80);
+    lv_obj_align(status_card, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_bg_color(status_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
+    lv_obj_set_style_border_width(status_card, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(status_card, lv_color_hex(0x667EEA), LV_PART_MAIN);
+    lv_obj_set_style_radius(status_card, 10, LV_PART_MAIN);
+    lv_obj_clear_flag(status_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *status_title = lv_label_create(status_card);
+    lv_label_set_text(status_title, "Status");
+    lv_obj_set_style_text_color(status_title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(status_title, LV_ALIGN_TOP_LEFT, 10, 5);
+
+    status_label = lv_label_create(status_card);
+    lv_label_set_text(status_label, "Initializing...");
+    lv_obj_set_style_text_color(status_label, lv_color_hex(0x9CA3AF), 0);
+    lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 10, 30);
+
+    /* Weight card */
+    lv_obj_t *weight_card = lv_obj_create(scr);
+    lv_obj_set_size(weight_card, 440, 80);
+    lv_obj_align_to(weight_card, status_card, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+    lv_obj_set_style_bg_color(weight_card, lv_color_hex(0x1A1F3A), LV_PART_MAIN);
+    lv_obj_set_style_border_width(weight_card, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(weight_card, lv_color_hex(0x4ECDC4), LV_PART_MAIN);
+    lv_obj_set_style_radius(weight_card, 10, LV_PART_MAIN);
+    lv_obj_clear_flag(weight_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *weight_title = lv_label_create(weight_card);
+    lv_label_set_text(weight_title, "Current Weight");
+    lv_obj_set_style_text_color(weight_title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(weight_title, LV_ALIGN_TOP_LEFT, 10, 5);
+
+    weight_label = lv_label_create(weight_card);
+    lv_label_set_text(weight_label, "-- g");
+    lv_obj_set_style_text_color(weight_label, lv_color_hex(0x4ECDC4), 0);
+    // Use default font
+    lv_obj_align(weight_label, LV_ALIGN_TOP_LEFT, 10, 30);
+
+    /* Capture button */
+    capture_btn = lv_button_create(scr);
+    lv_obj_set_size(capture_btn, 200, 60);
+    lv_obj_align(capture_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_set_style_bg_color(capture_btn, lv_color_hex(0x2196F3), LV_PART_MAIN);
+    lv_obj_set_style_radius(capture_btn, 10, LV_PART_MAIN);
+    lv_obj_add_event_cb(capture_btn, capture_btn_handler, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btn_label = lv_label_create(capture_btn);
+    lv_label_set_text(btn_label, "CAPTURE");
+    lv_obj_set_style_text_color(btn_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(btn_label);
+
+    ESP_LOGI(TAG, "Camera UI created");
+}
+
+static void lvgl_task(void *arg)
+{
+    /* Create UI after LVGL task starts */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    create_camera_ui();
+
+    uint32_t update_counter = 0;
+
+    while (1) {
+        /* Process LVGL timers */
+        lv_timer_handler();
+
+        /* Update weight display every 1 second */
+        if (update_counter % 100 == 0 && weight_label) {
+            double current_weight = hx711_get_weight_grams();
+            char weight_str[32];
+            snprintf(weight_str, sizeof(weight_str), "%.1f g", current_weight);
+            lv_label_set_text(weight_label, weight_str);
+        }
+
+        /* Update status every 5 seconds or when status changes */
+        if ((update_counter % 500 == 0 || ui_status_update) && status_label) {
+            lv_label_set_text(status_label, ui_status_message);
+            ui_status_update = false;
+        }
+
+        update_counter++;
+        vTaskDelay(pdMS_TO_TICKS(10)); // 10ms delay
+    }
+}
+
 /* ---------- app_main ---------- */
 
 void app_main(void)
@@ -931,42 +994,96 @@ void app_main(void)
 
     ili9488_init();
 
+    /* Initialize LVGL */
+    ESP_LOGI(TAG, "Initializing LVGL...");
+    lv_init();
+
+    /* LVGL tick */
+    const esp_timer_create_args_t tick_args = {
+        .callback = &tick_inc,
+        .name = "lv_tick"
+    };
+    esp_timer_handle_t tmr;
+    esp_timer_create(&tick_args, &tmr);
+    esp_timer_start_periodic(tmr, 1000);
+
+    /* Allocate RGB666 conversion buffer from PSRAM */
+    size_t rgb666_buf_size = HOR_RES * VER_RES * 3;
+    rgb666_buf = heap_caps_malloc(rgb666_buf_size, MALLOC_CAP_SPIRAM);
+    if (!rgb666_buf) {
+        rgb666_buf = heap_caps_malloc(rgb666_buf_size, MALLOC_CAP_DEFAULT);
+        if (!rgb666_buf) {
+            ESP_LOGE(TAG, "Failed to allocate rgb666_buf");
+            return;
+        }
+        ESP_LOGW(TAG, "rgb666_buf allocated from regular heap");
+    }
+
+    /* Allocate LVGL full-screen buffers from PSRAM */
+    size_t lvgl_buf_size_bytes = HOR_RES * VER_RES * sizeof(lv_color_t);
+    lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_SPIRAM);
+    lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_SPIRAM);
+
+    if (!lv_buf1 || !lv_buf2) {
+        ESP_LOGW(TAG, "PSRAM allocation failed, trying regular heap");
+        if (lv_buf1) free(lv_buf1);
+        if (lv_buf2) free(lv_buf2);
+        lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_DEFAULT);
+        lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_DEFAULT);
+        if (!lv_buf1 || !lv_buf2) {
+            ESP_LOGE(TAG, "Failed to allocate LVGL buffers!");
+            return;
+        }
+        ESP_LOGW(TAG, "Using regular heap for LVGL buffers");
+    }
+
+    /* Initialize LVGL draw buffers */
+    static lv_draw_buf_t draw_buf1, draw_buf2;
+    lv_draw_buf_init(&draw_buf1, HOR_RES, VER_RES, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO, lv_buf1, lvgl_buf_size_bytes);
+    lv_draw_buf_init(&draw_buf2, HOR_RES, VER_RES, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO, lv_buf2, lvgl_buf_size_bytes);
+
+    /* Create LVGL display */
+    disp = lv_display_create(HOR_RES, VER_RES);
+    if (!disp) {
+        ESP_LOGE(TAG, "lv_display_create failed");
+        return;
+    }
+
+    lv_display_set_flush_cb(disp, ili9488_flush);
+    lv_display_set_draw_buffers(disp, &draw_buf1, &draw_buf2);
+    lv_display_set_render_mode(disp, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
     ESP_LOGI(TAG, "Initializing HX711 load cell...");
     hx711_init();
     // Initial tare with balanced samples for stability and speed
     hx711_do_tare(20);
 
-    // Show initial message
-    fill_color(0x0000); // Black background
-    drawText(10, 10, "Initializing...", 0xFFFF, 3);
-    drawText(10, 50, "Please wait...", 0xFFFF, 2);
+    /* Create LVGL handler task */
+    const int LVGL_TASK_STACK = 8192;
+    BaseType_t r = xTaskCreatePinnedToCore(lvgl_task, "lvgl", LVGL_TASK_STACK, NULL, 5, NULL, 1);
+    if (r != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start lvgl task");
+        return;
+    }
 
+    update_ui_status("Initializing WiFi...");
     ESP_LOGI(TAG, "Initializing WiFi...");
     wifi_init_sta();
 
-    fill_color(0x0000); // Black background
-    drawText(10, 10, "WiFi Connected!", 0x07E0, 3);
-    drawText(10, 50, "Initializing camera...", 0x07E0, 2);
-
+    update_ui_status("Initializing camera...");
     ESP_LOGI(TAG, "Initializing camera...");
     myCAM = createArducamCamera(CS_PIN);
     begin(&myCAM);
 
-    fill_color(0x0000); // Black background
-    drawText(10, 10, "Camera Ready!", 0x07E0, 3);
-    drawText(10, 50, "Starting web server...", 0x07E0, 2);
-
+    update_ui_status("Starting web server...");
     ESP_LOGI(TAG, "Starting web server...");
     server = start_webserver();
     if (server) {
         ESP_LOGI(TAG, "Camera server started successfully!");
-        fill_color(0x0000); // Black background
-        drawText(10, 10, "Ready!", 0x07E0, 4);
-        drawText(10, 60, "Visit http://<ESP32_IP>/capture", 0x07E0, 2);
+        update_ui_status("Ready - Visit /capture endpoint");
     } else {
         ESP_LOGE(TAG, "Failed to start web server!");
-        fill_color(0x0000); // Black background
-        drawText(10, 10, "Web server failed!", 0xF800, 3);
+        update_ui_status("Web server failed!");
     }
 
     // Keep camera alive

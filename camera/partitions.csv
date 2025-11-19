@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Bootloader partition
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+phy_init, data, phy,     0xf000,  0x1000,
+# Increased app partition to 1.8MB to accommodate LVGL library (fits in 2MB flash)
+factory,  app,  factory, 0x10000, 0x1C0000,
