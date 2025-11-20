@@ -1,4 +1,5 @@
 #include "spi.h"
+#include "spi_mutex.h"
 #include <string.h>
 
 spi_device_handle_t spi; 
@@ -24,6 +25,9 @@ void spiBegin(void)
 
     spi_bus_initialize(CAMERA_HOST, &buscfg, SPI_DMA_DISABLED);
     spi_bus_add_device(CAMERA_HOST, &devcfg, &spi);
+
+    // Initialize SPI mutex for camera
+    spi_mutex_init(CAMERA_HOST);
 
 }
 
@@ -51,6 +55,9 @@ void spiCsLow(int cs)
 
 uint8_t spiReadWriteByte(uint8_t val)
 {
+    // Acquire SPI mutex for thread-safe access
+    spi_mutex_acquire(CAMERA_HOST);
+
     uint8_t rt = 0;
     spi_transaction_t t;
     memset(&t, 0, sizeof(t));       //Zero out the transaction
@@ -61,5 +68,9 @@ uint8_t spiReadWriteByte(uint8_t val)
     t.flags = SPI_TRANS_USE_RXDATA;
     spi_device_polling_transmit(spi, &t);  //Transmit!
     rt = t.rx_data[0];
+
+    // Release SPI mutex
+    spi_mutex_release(CAMERA_HOST);
+
     return rt;
 }

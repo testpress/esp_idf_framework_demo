@@ -17,6 +17,7 @@
 #include "nvs_flash.h"
 #include "driver/i2c.h"
 #include "priorities.h"
+#include "spi_mutex.h"
 #include "uart.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -230,6 +231,9 @@ static const uint8_t rgb565_b_lut[32] = {
 // Low-level SPI helpers
 static void send_cmd(uint8_t cmd)
 {
+    // Acquire SPI mutex for thread-safe access
+    spi_mutex_acquire(HSPI_HOST);
+
     gpio_set_level(PIN_TFT_DC, 0);
     spi_transaction_t t = {0};
     t.length = 8;
@@ -240,11 +244,18 @@ static void send_cmd(uint8_t cmd)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "send_cmd spi tx err %s", esp_err_to_name(err));
     }
+
+    // Release SPI mutex
+    spi_mutex_release(HSPI_HOST);
 }
 
 static void send_data_chunked(const uint8_t *data, size_t len)
 {
     if (!data || len == 0) return;
+
+    // Acquire SPI mutex for thread-safe access (whole operation)
+    spi_mutex_acquire(HSPI_HOST);
+
     gpio_set_level(PIN_TFT_DC, 1);
 
     spi_transaction_t t = {0};
@@ -268,6 +279,9 @@ static void send_data_chunked(const uint8_t *data, size_t len)
         }
         sent += to_send;
     }
+
+    // Release SPI mutex after all chunks sent
+    spi_mutex_release(HSPI_HOST);
 }
 
 // ILI9488 initialization
@@ -1592,6 +1606,9 @@ void app_main(void)
         .queue_size = 1
     };
     spi_bus_add_device(HSPI_HOST, &devcfg, &tft_spi);
+
+    // Initialize SPI mutex for TFT display
+    ESP_ERROR_CHECK(spi_mutex_init(HSPI_HOST));
 
     ili9488_init();
 
