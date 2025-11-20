@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "driver/i2c.h"
+#include "priorities.h"
 #include "uart.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,7 +65,7 @@
 #define MAXIMUM_RETRY 5
 
 // ---- HTTP upload config (change URL/token) ----
-static const char *UPLOAD_URL = "http://192.168.0.4:8000/api/v1/meal_logs/";
+static const char *UPLOAD_URL = "http://192.168.0.3:8000/api/v1/meal_logs/";
 static const char *AUTH_HEADER_VALUE = "Bearer iKnCz7E2Mtfl_V0bDcasJWDMzVN39L_BCySvj1hLDSc";
 
 // ---- Camera globals ----
@@ -1556,11 +1557,16 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    // [HEAP SNAPSHOT] After NVS init
+    ESP_LOGI(TAG, "[INIT] NVS Flash initialized");
+    diagnostics_print_heap_stats();
+
     uartBegin(115200);
     ESP_LOGI(TAG, "ESP32 Camera Server starting...");
 
     // Initialize diagnostics module
     diagnostics_init();
+    ESP_LOGI(TAG, "[INIT] Diagnostics module initialized");
 
     // Initialize display
     ESP_LOGI(TAG, "Initializing display...");
@@ -1588,6 +1594,10 @@ void app_main(void)
     spi_bus_add_device(HSPI_HOST, &devcfg, &tft_spi);
 
     ili9488_init();
+
+    // [HEAP SNAPSHOT] After display init
+    ESP_LOGI(TAG, "[INIT] Display (ILI9488) initialized");
+    diagnostics_print_heap_stats();
 
     /* Initialize LVGL */
     ESP_LOGI(TAG, "Initializing LVGL...");
@@ -1648,6 +1658,10 @@ void app_main(void)
     lv_display_set_draw_buffers(disp, &draw_buf1, &draw_buf2);
     lv_display_set_render_mode(disp, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
+    // [HEAP SNAPSHOT] After LVGL init + buffers
+    ESP_LOGI(TAG, "[INIT] LVGL initialized with display buffers");
+    diagnostics_print_heap_stats();
+
     /* Initialize touch controller */
     ESP_LOGI(TAG, "Initializing I2C for touch controller...");
     ESP_ERROR_CHECK(i2c_master_init());
@@ -1668,27 +1682,47 @@ void app_main(void)
     lv_indev_set_read_cb(indev, touch_read_cb);
     ESP_LOGI(TAG, "Touch input device registered");
 
+    // [HEAP SNAPSHOT] After touch controller init
+    ESP_LOGI(TAG, "[INIT] Touch controller (FT6206) initialized");
+    diagnostics_print_heap_stats();
+
     ESP_LOGI(TAG, "Initializing HX711 load cell...");
     hx711_init();
     // Initial tare with balanced samples for stability and speed
     hx711_do_tare(20);
 
+    // [HEAP SNAPSHOT] After HX711 init
+    ESP_LOGI(TAG, "[INIT] HX711 load cell initialized");
+    diagnostics_print_heap_stats();
+
     /* Create LVGL handler task */
     const int LVGL_TASK_STACK = 8192;
-    BaseType_t r = xTaskCreatePinnedToCore(lvgl_task, "lvgl", LVGL_TASK_STACK, NULL, 5, NULL, 1);
+    BaseType_t r = xTaskCreatePinnedToCore(lvgl_task, "lvgl", LVGL_TASK_STACK, NULL, TASK_PRIORITY_UI, NULL, 1);
     if (r != pdPASS) {
         ESP_LOGE(TAG, "Failed to start lvgl task");
         return;
     }
 
+    // [HEAP SNAPSHOT] After LVGL task creation
+    ESP_LOGI(TAG, "[INIT] LVGL UI task created");
+    diagnostics_print_heap_stats();
+
     update_ui_status("Initializing WiFi...");
     ESP_LOGI(TAG, "Initializing WiFi...");
     wifi_init_sta();
+
+    // [HEAP SNAPSHOT] After WiFi init
+    ESP_LOGI(TAG, "[INIT] WiFi STA initialized");
+    diagnostics_print_heap_stats();
 
     update_ui_status("Initializing camera...");
     ESP_LOGI(TAG, "Initializing camera...");
     myCAM = createArducamCamera(CS_PIN);
     begin(&myCAM);
+
+    // [HEAP SNAPSHOT] After camera init
+    ESP_LOGI(TAG, "[INIT] Camera (Arducam) initialized");
+    diagnostics_print_heap_stats();
 
     update_ui_status("Starting web server...");
     ESP_LOGI(TAG, "Starting web server...");
@@ -1696,9 +1730,17 @@ void app_main(void)
     if (server) {
         ESP_LOGI(TAG, "Camera server started successfully!");
         update_ui_status("Ready - Visit /capture endpoint");
+
+        // [HEAP SNAPSHOT] After full system init
+        ESP_LOGI(TAG, "[INIT] Web server started - System fully initialized!");
+        diagnostics_print_heap_stats();
     } else {
         ESP_LOGE(TAG, "Failed to start web server!");
         update_ui_status("Web server failed!");
+
+        // [HEAP SNAPSHOT] After failed web server init
+        ESP_LOGI(TAG, "[INIT] Web server failed - System partially initialized");
+        diagnostics_print_heap_stats();
     }
 
     // Keep camera alive and run periodic diagnostics

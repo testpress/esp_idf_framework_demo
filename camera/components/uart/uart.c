@@ -1,4 +1,5 @@
 #include "uart.h"
+#include "priorities.h"
 #include <string.h>
 
 uint8_t uartCommBuff[BUF_SIZE] = {0};
@@ -61,7 +62,7 @@ void uartInit(uint32_t baudrate)
 void uartBegin(uint32_t baudrate)
 {
     uartInit(baudrate);
-    xTaskCreate(uartReceiveTask, "uartReceiveTaskName", 3072, NULL, 10, NULL);
+    xTaskCreate(uartReceiveTask, "uartReceiveTaskName", 3072, NULL, TASK_PRIORITY_HIGH, NULL);
 }
 
 
