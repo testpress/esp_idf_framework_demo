@@ -592,7 +592,7 @@ static bool hx711_wait_ready(int timeout_ms) {
 }
 
 static int32_t hx711_read_raw(void) {
-    if (!hx711_wait_ready(500)) return 0;
+    if (!hx711_wait_ready(1000)) return 0;
 
     uint32_t value = 0;
     for (int i = 0; i < 24; i++) {
@@ -1600,7 +1600,7 @@ void app_main(void)
     spi_bus_initialize(HSPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 20 * 1000 * 1000,
+        .clock_speed_hz = 60 * 1000 * 1000,
         .mode = 0,
         .spics_io_num = PIN_TFT_CS,
         .queue_size = 2,                          // DMA-safe: small queue for efficiency
