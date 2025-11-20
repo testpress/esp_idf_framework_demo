@@ -13,17 +13,19 @@ void spiBegin(void)
         .sclk_io_num = PIN_NUM_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 32,
+        .max_transfer_sz = 4096,  // DMA-safe: larger buffer for efficient DMA transfers
     };
 
     spi_device_interface_config_t devcfg={
-        .mode=0,                                //SPI mode 0
-        .spics_io_num=-1,               //CS pin
-        .queue_size=256,                          //We want to be able to queue 7 transactions at a time
+        .mode = 0,                                // SPI mode 0
+        .spics_io_num = -1,                       // CS pin (managed externally)
+        .queue_size = 3,                          // DMA-safe: smaller queue for DMA efficiency
         .clock_speed_hz = CAMERA_SPI_CLK_FREQ,
+        .flags = SPI_DEVICE_NO_DUMMY,             // DMA-safe: no dummy bits
     };
 
-    spi_bus_initialize(CAMERA_HOST, &buscfg, SPI_DMA_DISABLED);
+    // Initialize with DMA channel for thread-safe, efficient transfers
+    spi_bus_initialize(CAMERA_HOST, &buscfg, SPI_DMA_CH_AUTO);
     spi_bus_add_device(CAMERA_HOST, &devcfg, &spi);
 
     // Initialize SPI mutex for camera
@@ -60,14 +62,21 @@ uint8_t spiReadWriteByte(uint8_t val)
 
     uint8_t rt = 0;
     spi_transaction_t t;
-    memset(&t, 0, sizeof(t));       //Zero out the transaction
-    t.length=8;                     //Command is 8 bits
-    t.tx_buffer=&val;               //The data is the cmd itself
-    t.user=(void*)0;                //D/C needs to be set to 0
-    t.rxlength = 8;
-    t.flags = SPI_TRANS_USE_RXDATA;
-    spi_device_polling_transmit(spi, &t);  //Transmit!
-    rt = t.rx_data[0];
+
+    // DMA-safe transaction configuration
+    memset(&t, 0, sizeof(t));
+    t.length = 8;                    // 8 bits to transmit
+    t.rxlength = 8;                  // 8 bits to receive
+    t.tx_buffer = &val;              // DMA-safe: use buffer instead of tx_data
+    t.rx_buffer = &rt;               // DMA-safe: use buffer instead of rx_data
+    t.user = (void*)0;               // User context (unused)
+
+    // Use DMA-capable polling transmit
+    esp_err_t err = spi_device_polling_transmit(spi, &t);
+    if (err != ESP_OK) {
+        ESP_LOGE("SPI", "DMA-safe transaction failed: %s", esp_err_to_name(err));
+        rt = 0; // Return 0 on error
+    }
 
     // Release SPI mutex
     spi_mutex_release(CAMERA_HOST);

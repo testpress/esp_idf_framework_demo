@@ -3,7 +3,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "hal/spi_types.h"
+#include "driver/spi_master.h"
 #include "esp_log.h"
 
 /**
@@ -72,6 +72,42 @@ esp_err_t spi_mutex_try_acquire(spi_host_device_t host);
  * @return Task name string or NULL if not held
  */
 const char* spi_mutex_get_holder(spi_host_device_t host);
+
+/**
+ * Execute DMA-safe SPI transaction with automatic mutex handling
+ * This function ensures proper DMA alignment and mutex synchronization
+ *
+ * @param handle SPI device handle
+ * @param host SPI host for mutex
+ * @param trans SPI transaction to execute
+ * @return ESP_OK on success
+ */
+esp_err_t spi_mutex_transmit(spi_device_handle_t handle, spi_host_device_t host, spi_transaction_t* trans);
+
+/**
+ * Check if a memory buffer is DMA-safe (properly aligned)
+ * DMA requires 32-bit alignment for optimal performance
+ *
+ * @param buffer Memory buffer to check
+ * @return true if DMA-safe, false otherwise
+ */
+bool spi_is_buffer_dma_safe(const void* buffer);
+
+/**
+ * Allocate DMA-safe buffer for SPI transactions
+ * Uses proper heap capabilities for DMA compatibility
+ *
+ * @param size Size in bytes
+ * @return DMA-safe buffer pointer or NULL on failure
+ */
+void* spi_dma_malloc(size_t size);
+
+/**
+ * Free DMA-safe buffer
+ *
+ * @param buffer Buffer allocated with spi_dma_malloc
+ */
+void spi_dma_free(void* buffer);
 
 #ifdef __cplusplus
 }

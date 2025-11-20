@@ -1,4 +1,5 @@
 #include "spi_mutex.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 
 #define TAG "spi_mutex"
@@ -164,4 +165,66 @@ const char* spi_mutex_get_holder(spi_host_device_t host) {
     }
 
     return spi_mutexes[index].holder_task_name;
+}
+
+/**
+ * Execute DMA-safe SPI transaction with automatic mutex handling
+ */
+esp_err_t spi_mutex_transmit(spi_device_handle_t handle, spi_host_device_t host, spi_transaction_t* trans) {
+    esp_err_t ret;
+
+    // Acquire SPI mutex
+    ret = spi_mutex_acquire(host);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Execute DMA-safe SPI transaction
+    ret = spi_device_polling_transmit(handle, trans);
+
+    // Release SPI mutex
+    spi_mutex_release(host);
+
+    return ret;
+}
+
+/**
+ * Check if a memory buffer is DMA-safe (properly aligned)
+ */
+bool spi_is_buffer_dma_safe(const void* buffer) {
+    if (buffer == NULL) {
+        return false;
+    }
+
+    // DMA requires at least 4-byte alignment for optimal performance
+    uintptr_t addr = (uintptr_t)buffer;
+    return (addr & 0x3) == 0; // Check 4-byte alignment
+}
+
+/**
+ * Allocate DMA-safe buffer for SPI transactions
+ */
+void* spi_dma_malloc(size_t size) {
+    // Try PSRAM first (DMA-capable with 8-bit alignment)
+    void* buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (buffer == NULL) {
+        // Fallback to internal RAM (DMA-capable)
+        buffer = heap_caps_malloc(size, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    }
+
+    if (buffer != NULL && !spi_is_buffer_dma_safe(buffer)) {
+        ESP_LOGW(TAG, "Allocated buffer is not DMA-aligned, this may impact performance");
+    }
+
+    return buffer;
+}
+
+/**
+ * Free DMA-safe buffer
+ */
+void spi_dma_free(void* buffer) {
+    if (buffer != NULL) {
+        heap_caps_free(buffer);
+    }
 }

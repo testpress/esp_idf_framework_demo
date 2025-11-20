@@ -22,3 +22,6 @@ Thumbs.db
 
 # ESP-IDF specific
 sdkconfig.old
+
+# Cache directories
+.cache/

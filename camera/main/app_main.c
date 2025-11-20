@@ -1603,7 +1603,8 @@ void app_main(void)
         .clock_speed_hz = 20 * 1000 * 1000,
         .mode = 0,
         .spics_io_num = PIN_TFT_CS,
-        .queue_size = 1
+        .queue_size = 2,                          // DMA-safe: small queue for efficiency
+        .flags = SPI_DEVICE_NO_DUMMY              // DMA-safe: no dummy bits
     };
     spi_bus_add_device(HSPI_HOST, &devcfg, &tft_spi);
 
