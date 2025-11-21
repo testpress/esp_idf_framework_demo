@@ -81,6 +81,22 @@ static lv_color_t *lv_buf1 = NULL;
 static lv_color_t *lv_buf2 = NULL;
 static uint8_t *rgb666_buf = NULL;
 
+// ---- FPS Measurement globals ----
+static uint32_t frame_count = 0;
+static int64_t last_fps_time = 0;
+
+// ---- FPS Measurement function ----
+static void measure_fps(void) {
+    frame_count++;
+    int64_t now = esp_timer_get_time();
+    if (now - last_fps_time >= 1000000) { // Every 1 second
+        float fps = frame_count * 1000000.0f / (now - last_fps_time);
+        ESP_LOGI(TAG, "FPS: %.1f", fps);
+        frame_count = 0;
+        last_fps_time = now;
+    }
+}
+
 // ---- Touch globals ----
 static volatile bool touch_interrupt_flag = false;
 
@@ -354,13 +370,17 @@ static inline void rgb565_to_rgb666_optimized(const uint16_t *src, uint8_t *dst,
 // LVGL flush callback
 static void ili9488_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
+    int64_t flush_start = esp_timer_get_time();
+
     uint16_t *src = (uint16_t *)px_map;
     int32_t w = lv_area_get_width(area);
     int32_t h = lv_area_get_height(area);
     int total = w * h;
 
     // Convert RGB565 to RGB666
+    int64_t conv_start = esp_timer_get_time();
     rgb565_to_rgb666_optimized(src, rgb666_buf, total);
+    int64_t conv_end = esp_timer_get_time();
 
     // Set column address (X coordinates)
     uint8_t col[4] = {
@@ -379,10 +399,21 @@ static void ili9488_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     send_data_chunked(row, 4);
 
     // Send RGB666 pixel data (3 bytes per pixel)
+    int64_t xfer_start = esp_timer_get_time();
     send_cmd(0x2C);
     send_data_chunked(rgb666_buf, total * 3);
+    int64_t xfer_end = esp_timer_get_time();
 
     lv_display_flush_ready(disp);
+
+    int64_t flush_end = esp_timer_get_time();
+
+    // Log timing information
+    ESP_LOGI(TAG, "FLUSH: area=%dx%d, conv=%lldus, xfer=%lldus, total=%lldus",
+             w, h, conv_end - conv_start, xfer_end - xfer_start, flush_end - flush_start);
+
+    // Measure FPS
+    measure_fps();
 }
 
 // ---- Touch functions ----
@@ -1699,34 +1730,22 @@ void app_main(void)
     esp_timer_create(&tick_args, &tmr);
     esp_timer_start_periodic(tmr, 1000);
 
-    /* Allocate RGB666 conversion buffer from PSRAM */
+    /* Allocate RGB666 conversion buffer (DMA-safe with PSRAM) */
     size_t rgb666_buf_size = HOR_RES * VER_RES * 3;
     rgb666_buf = heap_caps_malloc(rgb666_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!rgb666_buf) {
-        rgb666_buf = heap_caps_malloc(rgb666_buf_size, MALLOC_CAP_DEFAULT | MALLOC_CAP_8BIT);
-        if (!rgb666_buf) {
-            ESP_LOGE(TAG, "Failed to allocate rgb666_buf");
-            return;
-        }
-        ESP_LOGW(TAG, "rgb666_buf allocated from regular heap");
+        ESP_LOGE(TAG, "Failed to allocate DMA-safe rgb666_buf");
+        return;
     }
 
-    /* Allocate LVGL full-screen buffers from PSRAM */
-    size_t lvgl_buf_size_bytes = HOR_RES * VER_RES * sizeof(lv_color_t);
+    /* Allocate LVGL full-screen buffers (DMA-safe with PSRAM) */
+    size_t lvgl_buf_size_bytes = HOR_RES * VER_RES * sizeof(lv_color_t) + 8; // +8 bytes for palette
     lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     if (!lv_buf1 || !lv_buf2) {
-        ESP_LOGW(TAG, "PSRAM allocation failed, trying regular heap");
-        if (lv_buf1) free(lv_buf1);
-        if (lv_buf2) free(lv_buf2);
-        lv_buf1 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_DEFAULT | MALLOC_CAP_8BIT);
-        lv_buf2 = heap_caps_malloc(lvgl_buf_size_bytes, MALLOC_CAP_DEFAULT | MALLOC_CAP_8BIT);
-        if (!lv_buf1 || !lv_buf2) {
-            ESP_LOGE(TAG, "Failed to allocate LVGL buffers!");
-            return;
-        }
-        ESP_LOGW(TAG, "Using regular heap for LVGL buffers");
+        ESP_LOGE(TAG, "Failed to allocate DMA-safe LVGL buffers!");
+        return;
     }
 
     /* Initialize LVGL draw buffers */
