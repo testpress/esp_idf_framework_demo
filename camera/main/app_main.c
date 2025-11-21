@@ -410,6 +410,7 @@ static esp_err_t i2c_master_init(void)
  * -------------------------------------------------------------------*/
 #define FT6206_REG_NUMTOUCHES   0x02  // Number of touch points
 #define FT6206_REG_THRESHHOLD   0x80  // Touch threshold register
+#define FT6206_REG_MONITOR_MODE 0x88  // Monitor Mode Period Register
 #define FT6206_REG_P1_XH        0x03  // Point 1 X position high byte
 #define FT6206_REG_P1_XL        0x04  // Point 1 X position low byte
 #define FT6206_REG_P1_YH        0x05  // Point 1 Y position high byte
@@ -459,6 +460,7 @@ static void touch_interrupt_init(void)
 static esp_err_t ft6206_init(uint8_t threshold)
 {
     uint8_t data[2];
+    esp_err_t ret;
 
     // Set touch threshold
     data[0] = FT6206_REG_THRESHHOLD;
@@ -470,7 +472,25 @@ static esp_err_t ft6206_init(uint8_t threshold)
     i2c_master_write(cmd, data, 2, true);
     i2c_master_stop(cmd);
 
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // FIX: Disable Auto-Sleep/Monitor Mode to prevent first touch being missed
+    // Write 0x00 to Monitor Mode Period Register (0x88) to keep chip in Active Mode
+    data[0] = FT6206_REG_MONITOR_MODE;
+    data[1] = 0x00;  // Active Mode - no auto-sleep
+
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (FT6206_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(cmd, data, 2, true);
+    i2c_master_stop(cmd);
+
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
 
     return ret;
@@ -1738,6 +1758,10 @@ void app_main(void)
     touch_interrupt_init();
     ESP_ERROR_CHECK(ft6206_init(TOUCH_THRESHOLD));
     ESP_LOGI(TAG, "FT6206 touch controller initialized");
+
+    // CRITICAL FIX: Allow FT6206 hardware to settle after configuration
+    // The chip needs time to apply register settings before touch detection
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     /* Register touch input device with LVGL */
     lv_indev_t *indev = lv_indev_create();
