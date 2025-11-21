@@ -6,7 +6,7 @@
 #include "driver/gpio.h"
 
 
-#define CAMERA_HOST  VSPI_HOST
+#define CAMERA_HOST  HSPI_HOST
 #define PIN_NUM_MISO 19
 #define PIN_NUM_MOSI 26
 #define PIN_NUM_CLK  25

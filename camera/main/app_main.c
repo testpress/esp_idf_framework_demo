@@ -248,7 +248,7 @@ static const uint8_t rgb565_b_lut[32] = {
 static void send_cmd(uint8_t cmd)
 {
     // Acquire SPI mutex for thread-safe access
-    spi_mutex_acquire(HSPI_HOST);
+    spi_mutex_acquire(VSPI_HOST);
 
     gpio_set_level(PIN_TFT_DC, 0);
     spi_transaction_t t = {0};
@@ -262,7 +262,7 @@ static void send_cmd(uint8_t cmd)
     }
 
     // Release SPI mutex
-    spi_mutex_release(HSPI_HOST);
+    spi_mutex_release(VSPI_HOST);
 }
 
 static void send_data_chunked(const uint8_t *data, size_t len)
@@ -270,7 +270,7 @@ static void send_data_chunked(const uint8_t *data, size_t len)
     if (!data || len == 0) return;
 
     // Acquire SPI mutex for thread-safe access (whole operation)
-    spi_mutex_acquire(HSPI_HOST);
+    spi_mutex_acquire(VSPI_HOST);
 
     gpio_set_level(PIN_TFT_DC, 1);
 
@@ -297,7 +297,7 @@ static void send_data_chunked(const uint8_t *data, size_t len)
     }
 
     // Release SPI mutex after all chunks sent
-    spi_mutex_release(HSPI_HOST);
+    spi_mutex_release(VSPI_HOST);
 }
 
 // ILI9488 initialization
@@ -1353,7 +1353,7 @@ static void back_to_capture_handler(lv_event_t *e)
         ESP_LOGI(TAG, "Back to capture button pressed");
         // Switch back to capture tab
         if (tabview) {
-            lv_tabview_set_active(tabview, 0, LV_ANIM_ON);
+            lv_tabview_set_active(tabview, 0, LV_ANIM_OFF); // Disable animation to reduce stutter
         }
     }
 }
@@ -1448,6 +1448,11 @@ static void create_camera_ui(void)
     lv_obj_set_style_bg_color(tabview, lv_color_hex(0x0A0E27), LV_PART_MAIN);
     lv_obj_set_style_border_width(tabview, 0, LV_PART_MAIN);
     lv_tabview_set_tab_bar_size(tabview, 0); // Hide default tab bar
+
+    /* Scroll optimizations to reduce stutter */
+    lv_obj_set_scrollbar_mode(tabview, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_snap_x(tabview, LV_SCROLL_SNAP_NONE);
+    lv_obj_set_scroll_snap_y(tabview, LV_SCROLL_SNAP_NONE);
 
     /* Tab 1: Capture */
     tab_capture = lv_tabview_add_tab(tabview, "");
@@ -1697,19 +1702,19 @@ void app_main(void)
         .quadhd_io_num = -1,
         .max_transfer_sz = 320*480*3
     };
-    spi_bus_initialize(HSPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    spi_bus_initialize(VSPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 60 * 1000 * 1000,
+        .clock_speed_hz = 40 * 1000 * 1000,
         .mode = 0,
         .spics_io_num = PIN_TFT_CS,
         .queue_size = 2,                          // DMA-safe: small queue for efficiency
         .flags = SPI_DEVICE_NO_DUMMY              // DMA-safe: no dummy bits
     };
-    spi_bus_add_device(HSPI_HOST, &devcfg, &tft_spi);
+    spi_bus_add_device(VSPI_HOST, &devcfg, &tft_spi);
 
     // Initialize SPI mutex for TFT display
-    ESP_ERROR_CHECK(spi_mutex_init(HSPI_HOST));
+    ESP_ERROR_CHECK(spi_mutex_init(VSPI_HOST));
 
     ili9488_init();
 
@@ -1728,7 +1733,7 @@ void app_main(void)
     };
     esp_timer_handle_t tmr;
     esp_timer_create(&tick_args, &tmr);
-    esp_timer_start_periodic(tmr, 1000);
+    esp_timer_start_periodic(tmr, 5000); // 5ms tick for stable UI
 
     /* Allocate RGB666 conversion buffer (DMA-safe with PSRAM) */
     size_t rgb666_buf_size = HOR_RES * VER_RES * 3;
@@ -1763,6 +1768,10 @@ void app_main(void)
     lv_display_set_flush_cb(disp, ili9488_flush);
     lv_display_set_draw_buffers(disp, &draw_buf1, &draw_buf2);
     lv_display_set_render_mode(disp, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+    /* Additional scroll optimizations for reduced stutter */
+    lv_display_set_antialiasing(disp, false); // Disable antialiasing for better performance
+    lv_display_set_dpi(disp, 100); // Set reasonable DPI for scaling
 
     // [HEAP SNAPSHOT] After LVGL init + buffers
     ESP_LOGI(TAG, "[INIT] LVGL initialized with display buffers");
