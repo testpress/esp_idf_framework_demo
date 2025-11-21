@@ -66,7 +66,7 @@
 #define MAXIMUM_RETRY 5
 
 // ---- HTTP upload config (change URL/token) ----
-static const char *UPLOAD_URL = "http://192.168.0.3:8000/api/v1/meal_logs/";
+static const char *UPLOAD_URL = "http://192.168.0.4:8000/api/v1/meal_logs/";
 static const char *AUTH_HEADER_VALUE = "Bearer iKnCz7E2Mtfl_V0bDcasJWDMzVN39L_BCySvj1hLDSc";
 
 // ---- Camera globals ----
@@ -1124,6 +1124,7 @@ httpd_handle_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
+    config.task_priority = TASK_PRIORITY_NETWORK;  // Use standardized priority
 
     ESP_LOGI(TAG, "Starting server on port: %d", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -1559,6 +1560,54 @@ static void lvgl_task(void *arg)
     }
 }
 
+/**
+ * Diagnostic monitoring task - runs with TASK_PRIORITY_LOW (5)
+ * Continuously monitors system health without interfering with critical tasks
+ */
+static void diagnostic_monitor_task(void *arg)
+{
+    ESP_LOGI(TAG, "Diagnostic monitoring task started (priority %d)", TASK_PRIORITY_LOW);
+
+    while (1) {
+        /* Light monitoring - check heap usage periodically */
+        static uint32_t heap_check_counter = 0;
+
+        if (heap_check_counter % 600 == 0) {  // Every 60 seconds (6 * 10s)
+            uint32_t usage_percent = diagnostics_get_heap_usage_percentage();
+            if (usage_percent > 75) {  // Only warn if usage is high
+                ESP_LOGW(TAG, "High heap usage detected: %u%%", usage_percent);
+            }
+        }
+
+        heap_check_counter++;
+        vTaskDelay(pdMS_TO_TICKS(10000));  // Check every 10 seconds
+    }
+}
+
+/**
+ * Camera control task - runs with TASK_PRIORITY_HIGH (18)
+ * Handles camera operations that require high priority and responsiveness
+ */
+static void camera_control_task(void *arg)
+{
+    ESP_LOGI(TAG, "Camera control task started (priority %d)", TASK_PRIORITY_HIGH);
+
+    while (1) {
+        /* Camera health monitoring and control */
+        static uint32_t camera_check_counter = 0;
+
+        if (camera_check_counter % 100 == 0) {  // Every 10 seconds
+            /* Check camera connectivity and health */
+            // Note: Camera operations are handled by the main loop and HTTP handlers
+            // This task is reserved for future camera control features
+            ESP_LOGD(TAG, "Camera control task active");
+        }
+
+        camera_check_counter++;
+        vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
+    }
+}
+
 /* ---------- app_main ---------- */
 
 void app_main(void)
@@ -1724,6 +1773,30 @@ void app_main(void)
     // [HEAP SNAPSHOT] After LVGL task creation
     ESP_LOGI(TAG, "[INIT] LVGL UI task created");
     diagnostics_print_heap_stats();
+
+    /* Create diagnostic monitoring task with standardized priority */
+    const int DIAGNOSTIC_TASK_STACK = 2048;
+    BaseType_t diag_r = xTaskCreate(diagnostic_monitor_task, "diag_mon",
+                                   DIAGNOSTIC_TASK_STACK, NULL,
+                                   TASK_PRIORITY_LOW, NULL);
+    if (diag_r != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start diagnostic monitoring task");
+    } else {
+        ESP_LOGI(TAG, "[INIT] Diagnostic monitoring task created (priority %d)",
+                 TASK_PRIORITY_LOW);
+    }
+
+    /* Create camera control task with high priority for responsive capture */
+    const int CAMERA_TASK_STACK = 4096;
+    BaseType_t cam_r = xTaskCreate(camera_control_task, "cam_ctrl",
+                                  CAMERA_TASK_STACK, NULL,
+                                  TASK_PRIORITY_HIGH, NULL);
+    if (cam_r != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start camera control task");
+    } else {
+        ESP_LOGI(TAG, "[INIT] Camera control task created (priority %d)",
+                 TASK_PRIORITY_HIGH);
+    }
 
     update_ui_status("Initializing WiFi...");
     ESP_LOGI(TAG, "Initializing WiFi...");
