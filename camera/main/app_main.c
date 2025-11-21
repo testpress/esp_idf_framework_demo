@@ -54,7 +54,7 @@
 #define PIN_TOUCH_IRQ  27
 #define PIN_TOUCH_RST  32
 #define FT6206_I2C_ADDR    0x38
-#define TOUCH_THRESHOLD    40
+#define TOUCH_THRESHOLD    10
 
 // ---- HX711 Load Cell pins ----
 #define HX_DOUT 34
